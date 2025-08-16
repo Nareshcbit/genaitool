@@ -1,0 +1,315 @@
+Prompt to Q — Part 3: Build L3 Routing Graph & L4 Filter Graph (Paths & Evaluators)
+
+Role: You are a senior cloud graph engineer. Using the canonical schema (Part 1) and ETL outputs (Part 2), produce an implementation-ready spec and code for:
+
+An L3 routing graph that models IP reachability (routes, TGW, peering, endpoints), and
+
+An L4 filter layer that evaluates Security Groups (stateful) and NACLs (stateless) for a given (src_ip, dst_ip, proto, port).
+
+Your deliverables must include algorithms, data structures, openCypher utilities (Neptune/Neo4j) and Python/NetworkX utilities, plus test cases and edge-case handling.
+
+Inputs / Context
+
+Graph nodes/edges and JSONL upserts produced in Part 2 (views like vw_vpc_routes, vw_tgw_routes, vw_eni_effective, vw_sg_rules_expanded, vw_nacl_rules_expanded, etc.).
+
+Canonical node/edge labels from Part 1 (VPC, Subnet, RouteTable, Route targets IGW/NATGW/ENI/PCX/TGW_ATTACH/VPCE, TGW* objects, ENI, SG, NACL, VPCE).
+
+Multi-account, multi-region environment.
+
+Goal
+
+Deliver precise, reproducible path computation that answers:
+
+Is traffic from source ENI/IP to destination ENI/IP reachable on (proto, port)?
+
+If yes, return one or more valid paths (ordered nodes/edges) with reasons (which routes/rules allowed each hop).
+
+If no, return the first blocking reason (missing route, SG deny, NACL deny, blackhole, asymmetric route, etc.).
+
+Scope & Required Modeling (must include)
+A) L3 “Routing” Graph (ignore SG/NACL here)
+
+Vertices: Subnet, RouteTable, Gateway targets (IGW, NATGW, VPCE_IF, VPCE_GW, VGW), TgwAttachment, TgwRouteTable, VpcPeering (PCX), and optional ENI vertices for instance-level start/end anchoring.
+
+Edges:
+
+Subnet -> RouteTable (ASSOCIATED_WITH; main or explicit association)
+
+RouteTable -[HAS_ROUTE {destCidr, targetType, targetId, state}]-> Target
+
+TGW layer:
+
+TgwAttachment -[:ASSOCIATED_WITH]-> TgwRouteTable
+
+TgwAttachment -[:PROPAGATES_TO]-> TgwRouteTable
+
+TgwRouteTable -[HAS_ROUTE {destCidr, targetAttachmentId, blackhole}]-> TgwAttachment
+
+Derived rule: allow hop AttachA -> AttachB iff AttachA PROPAGATES_TO RtX and RtX HAS_ROUTE to AttachB matching dst_ip.
+
+Peering: derived inter-VPC hop valid only if both VPCs have routes to the same PCX that match the respective dst_ip/return path (note asymmetry).
+
+Endpoints: model gateway endpoints (S3/Dynamo) as RouteTable routes; model interface endpoints as target nodes with ENIs & SGs (L3 hop stops at VPCE ENI).
+
+Edge condition at search time: dst_ip ∈ destCidr AND state != blackhole.
+
+B) L4 “Filter” Layer (stateful/ stateless)
+
+Security Groups (stateful):
+
+Source ENI egress allows (proto, port, dst) where dst may be cidr or sg-ref.
+
+Destination ENI ingress allows (proto, port, src) where src may be cidr or sg-ref.
+
+Handle SG-to-SG refs by resolving to sets of ENIs or by comparing SG IDs directly if supported.
+
+Expand PrefixLists to CIDRs.
+
+NACLs (stateless):
+
+Subnet ingress allows packet from src_ip to dst_ip on (proto, port).
+
+Subnet egress allows packet on the way out; note that real traffic needs both directions—document model choice (forward-only vs. simulate return).
+
+Effective decision: compute for tuple (src_ip, dst_ip, proto, port) at terminal leg(s) ENI↔ENI (and LB/VPCE ENIs if traversed).
+
+Output Format (produce ALL sections)
+Section 1 — Data Structures & Indexes
+
+Routing index structures (pseudo-types / JSON) you will precompute after loading:
+
+subnetToRtb[subnet_id] -> rtb_id
+
+rtbRoutes[rtb_id] -> [{destCidr, targetType, targetId, state}] (+ prefix trie for fast CIDR match)
+
+tgwAssoc[attach_id] -> rt_id
+
+tgwPropag[attach_id] -> Set<rt_id>
+
+tgwRtRoutes[rt_id] -> [{destCidr, targetAttachmentId, blackhole}]
+
+pcxPeers[pcx_id] -> {vpc_a, vpc_b}
+
+Security indexes:
+
+eniIndex[eni_id] -> {subnet_id, vpc_id, primaryIp, sg_ids[]}
+
+sgIngress[sg_id] -> [normalized rules]
+
+sgEgress[sg_id] -> [normalized rules]
+
+naclBySubnet[subnet_id] -> {ingressRules[], egressRules[]}
+
+prefixListIndex[prefixListId] -> [cidrs]
+
+Caching: LRU for (src_eni, dst_eni, proto, port) results; route prefix trie for rtb/tgw tables.
+
+Section 2 — Algorithms (clear, step-by-step)
+
+Provide precise pseudocode (and Big-O) for:
+
+2.1 Find L3 Candidates (BFS/Dijkstra)
+
+Inputs: src_subnet_id, dst_ip
+
+Steps:
+
+rtb = subnetToRtb[src_subnet_id] (or main RT)
+
+Expand rtbRoutes[rtb] where dst_ip ∈ destCidr && state!=blackhole:
+
+If targetType ∈ {ENI, IGW, NATGW, VPCE_* , PCX} → push that node.
+
+If targetType == TGW_ATTACH → enter TGW domain:
+
+rt = tgwAssoc[attachA] (associated table)
+
+For each rtx ∈ tgwPropag[attachA] ∪ {rt} check tgwRtRoutes[rtx] with match on dst_ip → attachB and !blackhole
+
+From attachB, hop back into VPC-B: confirm VPC-B route table has route to local dst_ip (implicit local OK)
+
+Continue until a node that owns dst_ip (dest Subnet/ENI) is reached or frontier exhausted.
+
+Return top-k minimal paths.
+
+2.2 L4 Confirmation (SG & NACL)
+
+Inputs: (src_eni, dst_eni, proto, port, src_ip, dst_ip)
+
+SG evaluation rules (ingress/egress, SG-ref, prefix list expansion, all proto semantics).
+
+NACL evaluation rules (ordered by rule number, first match wins; egress+ingress).
+
+Result: ALLOWED/DENIED, with list of matched rules.
+
+2.3 Overall reachable()
+
+Compose 2.1 + 2.2; if multiple L3 candidates, short-circuit when first L4 passes; else return best L3 with first L4 block reason.
+
+Section 3 — Cypher Utilities (Neptune/Neo4j)
+
+Provide openCypher helper queries:
+
+3.1 Shortest L3 path skeleton (relationships only; filtering by destCidr happens via parameters or pre-filtered subgraph):
+
+// Parameters: $srcSubnetId, $dstIp, $maxHops
+MATCH (s:Subnet {id:$srcSubnetId})
+CALL {
+  WITH s, $dstIp AS dst
+  // Expand to RT and route targets; TGW hops materialized as edges by ETL or derived via views
+  MATCH p = (s)-[:ASSOCIATED_WITH]->(rt:RouteTable)
+            -[:HAS_ROUTE]->(t)
+  WHERE any(r IN relationships(p) WHERE coalesce(r.destCidr,'') <> '' AND destCidrMatches(r.destCidr, dst) AND coalesce(r.state,'active') <> 'blackhole')
+  RETURN p LIMIT $maxHops
+}
+RETURN p
+
+
+(Explain that destCidrMatches is a custom function or pre-filtered expansion.)
+
+3.2 Fetch SG/NACL artifacts for terminal ENIs on a candidate path (for L4 check outside the DB).
+
+3.3 Path materialization: return nodes/edges with enough props (rtb_id, destCidr, targetType, targetId) to annotate diagrams.
+
+Section 4 — Python / NetworkX Reference Implementation
+
+Provide runnable-style code blocks (concise) for:
+
+4.1 Build graphs
+
+G_l3 = nx.DiGraph()   # Routing
+# add nodes/edges from JSONL produced in Part 2
+# edge attrs: destCidr, targetType, targetId, state
+
+
+4.2 Prefix matching
+
+class PrefixTrie:
+    def add(self, cidr): ...
+    def contains(self, ip): ...
+
+
+4.3 L3 search (BFS)
+
+def find_l3_paths(src_subnet, dst_ip, k=3, max_hops=12): ...
+
+
+4.4 SG/NACL evaluators
+
+def sg_allows(egress_rules, ingress_rules, proto, port, src_ip, dst_ip, src_sgs, dst_sgs, prefix_lists): ...
+def nacl_allows(nacl_ing, nacl_egr, proto, port, src_ip, dst_ip): ...
+
+
+4.5 Top-level
+
+def reachable(src_eni, dst_eni, proto, port) -> (bool, path, reasons): ...
+
+
+Include docstrings and clarify where you assume data from Part 2 views.
+
+Section 5 — Edge Cases & Semantics (must address)
+
+Asymmetric routes (esp. TGW/PCX) — show how you detect and flag.
+
+LOCAL routes implicit in VPC — treat as always present within CIDR.
+
+Blackhole routes (VPC & TGW) — prune immediately.
+
+Multiple RT associations (subnet-specific vs. main table).
+
+VPCE (interface & gateway) — interface endpoint requires L4 SG checks on endpoint ENIs; gateway is a route target only.
+
+ALB/NLB traversal (optional): model listener → target group → targets; enforce LB SGs and port mappings if path goes through LB.
+
+PrefixLists expansion and large rule sets performance notes.
+
+Return path modeling (document choice; recommend forward-path check with optional reverse confirmation).
+
+Section 6 — Performance & Caching
+
+Prebuild prefix tries per RT/TGW RT.
+
+Memoize (subnet, dst_ip) -> next-hop candidates.
+
+Cache SG/NACL decisions per (sg_set_src, sg_set_dst, proto, port, cidr_bucket).
+
+Constrain search with max_hops, per-domain hop caps (VPC ≤ 4, TGW ≤ 4, etc.).
+
+Provide complexity notes.
+
+Section 7 — Testing & Validation
+
+Unit tests for:
+
+VPC-internal path (private subnet → private subnet via local).
+
+Private subnet → Internet via NATGW.
+
+VPC-A → VPC-B via TGW with correct assoc/propagation/routes.
+
+PCX with asymmetric route producing no path.
+
+SG ingress deny; NACL egress deny; prefix list allow.
+
+Golden fixtures: small JSON snippets for routes/SG/NACL.
+
+Property-based tests for random CIDR/rule sets.
+
+Section 8 — API & Output Contract
+
+Design a small service interface:
+
+POST /reachability
+
+{
+  "srcEniId": "eni-aaa",
+  "dstEniId": "eni-bbb",
+  "proto": "tcp",
+  "port": 443
+}
+
+
+Response
+
+{
+  "reachable": true,
+  "paths": [
+    {
+      "nodes": ["eni-aaa","subnet-a","rtb-a","tgw-attach-a","tgw-rt-1","tgw-attach-b","rtb-b","subnet-b","eni-bbb"],
+      "edges": [{"type":"HAS_ROUTE","rtb":"rtb-a","destCidr":"10.20.0.0/16","targetType":"TGW_ATTACH","targetId":"tgw-attach-a"}, ...],
+      "reasons": ["SG egress sg-1 allows tcp/443 to sg-2","NACL ingress acl-5 rule#110 allow"]
+    }
+  ],
+  "blockedBy": null
+}
+
+Section 9 — Worked Example (small, end-to-end)
+
+Provide a compact example with:
+
+VPC-A (10.0.0.0/16) Subnet-A → 0.0.0.0/0 -> tgw-attach-a
+
+TGW RT has 10.20.0.0/16 -> tgw-attach-b
+
+VPC-B (10.20.0.0/16) Subnet-B (local)
+
+SGs: src egress allow tcp/443 to dst sg; dst ingress allow tcp/443 from src sg
+
+NACLs: allow corresponding flows
+Show L3 candidate path and L4 pass, then the JSON response and a tiny DOT subgraph snippet for rendering.
+
+Acceptance Criteria
+
+Clean separation: L3 graph produces candidate paths without SG/NACL; L4 evaluator decides allow/deny.
+
+TGW semantics (association + propagation + RT routes) are correctly enforced.
+
+Peering requires routes on both sides; asymmetric cases are blocked with a clear reason.
+
+Handling of VPCE and BLACKHOLE routes is explicit.
+
+Python and Cypher utilities are consistent with Part 1–2 schemas.
+
+Includes unit test outlines and performance guidance.
+
+Output contract is explicit and ready to wire to a UI.
