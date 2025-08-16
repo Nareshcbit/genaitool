@@ -1,0 +1,268 @@
+Prompt to Q — Build ETL from AWS Describe* to Graph (Athena → Upserts)
+
+Role: You are a senior data engineer and cloud graph modeler. Produce a complete, implementation‑ready ETL spec and artifacts that transform enriched AWS Describe* data (stored in S3/Parquet with Glue/Athena) into a property graph per the canonical schema already defined in Step 1.
+
+Inputs / Context
+
+Source data: Parquet tables partitioned by account_id, region, service holding outputs of Describe* APIs (and Resource Explorer lookups).
+
+Destination graph: either Amazon Neptune (openCypher) or an in‑memory NetworkX graph (both must be supported).
+
+We need lightweight Athena views that normalize/denormalize into tidy rows that map 1:1 to graph node/edge upserts.
+
+Idempotency required using state_hash and stable keys.
+
+Goal
+
+Deliver:
+
+Athena DDL + Views that shape Describe* into graph‑ready rows.
+
+Target normalization rules (route targets, SG refs, etc.).
+
+Upsert payload formats (JSONLines for nodes/edges).
+
+Loader templates for Neptune (Cypher MERGE) and NetworkX (Python).
+
+Idempotency & incremental logic using updated_at and state_hash.
+
+Validation queries to sanity‑check the ETL (counts, joins).
+
+Worked example (small TGW case) showing inputs → views → upserts.
+
+Source→View Mapping (must cover)
+
+VPC / Subnet / ENI
+
+describe-vpcs → VPC nodes
+
+describe-subnets (+ derived is_private) → Subnet nodes; Subnet -> RouteTable (main) via describe-route-tables.associations
+
+describe-network-interfaces → ENI nodes + ENI -> Subnet, ENI -> SecurityGroup
+
+Route tables (VPC layer)
+
+describe-route-tables → RouteTable nodes + HAS_ROUTE edges with props {destCidr, targetType, targetId, state}
+
+Normalize target:
+
+gatewayId → IGW if attached internet gateway; VGW if virtual private gateway
+
+natGatewayId → NATGW
+
+instanceId or networkInterfaceId → ENI (prefer ENI ID)
+
+vpcPeeringConnectionId → PCX
+
+transitGatewayId → TGW_ATTACH (resolve to the local VPC’s TGW attachment id)
+
+local route → LOCAL
+
+blackhole → BLACKHOLE
+
+NACLs
+
+describe-network-acls → NetworkAcl nodes + NaclRule (edge props or child rows), and Subnet -> Nacl
+
+Security groups
+
+describe-security-groups → SecurityGroup nodes + SgRule (edge props or child rows); expand SG‑to‑SG references & PrefixLists into normalized rows
+
+Gateways & peering
+
+describe-internet-gateways, describe-nat-gateways, describe-vpc-peering-connections
+
+TGW
+
+describe-transit-gateways → TransitGateway nodes
+
+describe-transit-gateway-attachments → TgwAttachment nodes; ATTACHED edges to VPC and TGW
+
+describe-transit-gateway-route-tables → TgwRouteTable nodes
+
+get-transit-gateway-route-table-associations → edges TgwAttachment -[:ASSOCIATED_WITH]-> TgwRouteTable
+
+get-transit-gateway-route-table-propagations → edges TgwAttachment -[:PROPAGATES_TO]-> TgwRouteTable
+
+search-transit-gateway-routes → HAS_ROUTE edges on TGW RT with {destCidr, targetAttachmentId, blackhole}
+
+Endpoints
+
+describe-vpc-endpoints (interface & gateway), include endpoint ENI SGs for interface endpoints.
+
+All rows must include: account_id, region, stable natural IDs, updated_at, state_hash (hash of salient properties for change detection).
+
+Output Format (produce ALL sections)
+Section A — Athena DDL & Views (SQL)
+
+Provide CREATE EXTERNAL TABLE (if needed) or assume existing tables and produce CREATE OR REPLACE VIEW for:
+
+vw_vpcs(account_id, region, vpc_id, cidr, dnsHostnames, dnsSupport, tags, updated_at, state_hash)
+
+vw_subnets(account_id, region, subnet_id, vpc_id, az, cidr, is_private:boolean, route_table_id, nacl_id, tags, updated_at, state_hash)
+
+Derive is_private using presence of default route to IGW in its associated/main route table (no IGW → private).
+
+vw_route_tables(account_id, region, rtb_id, vpc_id, is_main:boolean, updated_at, state_hash)
+
+vw_vpc_routes(account_id, region, rtb_id, vpc_id, src_subnet_id_nullable, destCidr, targetType ENUM, targetId, state ENUM, updated_at, state_hash)
+
+src_subnet_id_nullable filled when association is subnet‑specific; null when via main table (applies to all subnets).
+
+vw_network_acls(account_id, region, nacl_id, vpc_id, is_default, updated_at, state_hash)
+
+vw_nacl_rules(account_id, region, nacl_id, dir ENUM, proto ENUM, portMin, portMax, action ENUM, cidr, ruleNo:int)
+
+vw_security_groups(account_id, region, sg_id, vpc_id, ruleCount:int, tags, updated_at, state_hash)
+
+vw_sg_rules(account_id, region, sg_id, dir ENUM, proto ENUM, portMin, portMax, srcKind ENUM {cidr,sg,prefixList}, srcValue, description)
+
+Expand PrefixList IDs to constituent CIDRs via ec2:DescribePrefixLists dataset (assume present as prefix_lists table/view).
+
+vw_enis(account_id, region, eni_id, vpc_id, subnet_id, primary_private_ip, sg_ids ARRAY<string>, description, updated_at, state_hash)
+
+vw_ec2_instances(account_id, region, instance_id, eni_ids ARRAY<string>, state, tags, updated_at, state_hash)
+
+vw_internet_gateways(account_id, region, igw_id, vpc_id_nullable, attached:boolean)
+
+vw_nat_gateways(account_id, region, natgw_id, vpc_id, subnet_id, eip, state)
+
+vw_vpc_peerings(account_id, region, pcx_id, vpc_id_a, vpc_id_b, accepter_cidrs ARRAY<ipCidr>, requester_cidrs ARRAY<ipCidr>, status)
+
+vw_tgws(account_id, region, tgw_id, description, owner_id)
+
+vw_tgw_attachments(account_id, region, tgw_attachment_id, tgw_id, vpc_id, subnet_ids ARRAY<string>, attachment_state)
+
+vw_tgw_route_tables(account_id, region, tgw_rt_id, tgw_id)
+
+vw_tgw_associations(account_id, region, tgw_attachment_id, tgw_rt_id)
+
+vw_tgw_propagations(account_id, region, tgw_attachment_id, tgw_rt_id)
+
+vw_tgw_routes(account_id, region, tgw_rt_id, destCidr, targetAttachmentId, blackhole:boolean)
+
+vw_vpc_endpoints(account_id, region, vpce_id, vpc_id, type ENUM {interface,gateway}, service, subnet_ids ARRAY<string>, sg_ids ARRAY<string>, route_table_ids ARRAY<string>, policyDocument)
+
+Requirements for SQL section:
+
+Use Presto/Trino SQL dialect (Athena).
+
+Show key derived computations (e.g., is_private).
+
+Compute state_hash as md5(json_format(CAST(row AS JSON))) (or equivalent column list).
+
+Include comments explaining joins to resolve TGW attach id from transitGatewayId for route normalization.
+
+Section B — Target Normalization Rules (explicit)
+
+Provide a concise mapping table and pseudo‑SQL/CASE statements that convert raw route fields into {targetType, targetId} with precedence rules and state mapping (active vs blackhole). Include notes for:
+
+LOCAL route (implicit per VPC CIDR)
+
+Instance‑targeted routes: prefer networkInterfaceId; if absent use instanceId → primary ENI via join.
+
+TGW: resolve local VPC’s tgw_attachment_id when transitGatewayId is present.
+
+Gateway endpoint routes (S3/Dynamo) via RT associations for gateway endpoints.
+
+Section C — Upsert Payload Specs (JSONLines)
+
+Define two line‑oriented JSON specs:
+
+Nodes (nodes.jsonl):
+
+{"type":"Subnet","id":"<acct>:<region>:subnet-abc","accountId":"...","region":"...","properties":{...},"labels":["Subnet","AWS"]}
+
+
+Edges (edges.jsonl):
+
+{"type":"ASSOCIATED_WITH","fromId":"<...:subnet-abc>","toId":"<...:rtb-123>","properties":{"source":"association","updatedAt":"..."}}
+
+
+List the exact fields required per node/edge type (matching Step 1). Include updatedAt and stateHash in node properties and sourceSnapshotAt for edges.
+
+Section D — Loader Templates
+
+Neptune openCypher MERGE templates (idempotent) for:
+
+Nodes: VPC, Subnet, RouteTable, InternetGateway, NatGateway, VpcPeering, ENI, EC2Instance, SecurityGroup, NetworkAcl, TransitGateway, TgwAttachment, TgwRouteTable, VpcEndpoint.
+
+Edges: ASSOCIATED_WITH (Subnet→RouteTable), HAS_ROUTE (RouteTable→Target with route props), PLACED_IN (ENI→Subnet), USES (ENI→SecurityGroup), ATTACHED (VPC→IGW/NATGW/PCX/TGWAttachment), ASSOCIATED_WITH (TgwAttachment→TgwRouteTable), PROPAGATES_TO (TgwAttachment→TgwRouteTable), HAS_ROUTE (TgwRouteTable→TgwAttachment with destCidr/blackhole), ASSOCIATED_WITH (Subnet→NetworkAcl).
+
+Show parameter names and a minimal batching example (UNWIND $rows AS row ... MERGE ...).
+
+NetworkX loader snippets (Python)
+
+add_node(node_type, id, **attrs) and add_edge(edge_type, from_id, to_id, **attrs) helpers with TypedDict hints.
+
+Example of reading nodes.jsonl / edges.jsonl and upserting into two graphs: G_routing (L3) and G_security (rules held as attributes).
+
+Section E — Incremental / Idempotent Logic
+
+Explain and provide pseudocode for:
+
+Selecting changed rows only since last watermark: WHERE updated_at > :last_success_at OR state_hash != last_ingested_hash.
+
+Deleting or tombstoning nodes/edges when a resource disappears (include disposition flag or separate deletes.jsonl).
+
+Ordering of operations: nodes first, then edges; guarantee targets exist or queue edge retries (DLQ).
+
+Section F — Validation & Sanity Checks (Athena SQL)
+
+Provide runnable checks:
+
+Counts by type between raw tables and views.
+
+“Subnets without associated RT” and “Subnets without NACL” anomaly queries.
+
+“RT routes referencing unknown targets” (left joins to target views).
+
+TGW consistency: attachment ↔ association ↔ route table presence.
+
+SG/NACL rule expansion totals (no loss vs raw counts).
+
+Example reachability pre‑check: existence of default routes from private subnets to NATGW.
+
+Section G — Worked Example (small)
+
+Use a contrived but realistic case:
+
+VPC‑A (10.0.0.0/16) with Subnet‑A, RT‑A: local + 0.0.0.0/0 → tgw‑attach‑A.
+
+TGW with RT‑T: route 10.20.0.0/16 → tgw‑attach‑B.
+
+VPC‑B (10.20.0.0/16) with Subnet‑B, RT‑B: local.
+
+Show 6–8 sample raw rows (from Describe*) → show each view row → show the node/edge JSONL → show the Cypher that would be executed.
+
+Conventions & Types
+
+Use camelCase property names.
+
+Enumerations (repeat from Step 1 to keep Q aligned):
+
+targetType ∈ {IGW,NATGW,ENI,TGW_ATTACH,PCX,VPCE_IF,VPCE_GW,VGW,LOCAL,BLACKHOLE}
+
+dir ∈ {ingress,egress}, proto ∈ {tcp,udp,icmp,all}, action ∈ {allow,deny}
+
+ID strategy: "{accountId}:{region}:{label}:{naturalId}".
+
+state_hash: md5 of a stable JSON of salient fields (list them per view).
+
+Every output row must include account_id, region, updated_at, state_hash.
+
+Acceptance Criteria
+
+All listed views compile in Athena and include only the columns specified (plus helpful tags).
+
+Normalization rules unambiguously map all VPC routes & TGW routes to {targetType,targetId}.
+
+Upsert payloads validate against Step‑1 JSON Schemas (node/edge).
+
+Neptune MERGEs are idempotent and NetworkX loader works with the same JSONL.
+
+Validation queries detect common misconfigurations (missing associations, unknown targets).
+
+Worked example demonstrates end‑to‑end transform clearly.
+
+Deliverables: Output Sections A–G in order, with code blocks where appropriate. Keep the SQL and Cypher concise and production‑ready.
