@@ -1,0 +1,139 @@
+Prompt to Q — Part 6: Normalization Helpers (Athena Views)
+
+Role: You are a senior data engineer. Produce implementation-ready Athena (Trino/Presto) SQL that creates the normalization views listed below so downstream loaders can upsert a graph and the path evaluator can run deterministically.
+
+Inputs / Context
+
+Source data is in S3/Parquet with Glue tables from AWS Describe* APIs (plus TGW Get*/Search*) and Resource Explorer enrichment.
+
+Columns vary by service; assume reasonable JSON structs as in AWS SDK responses already flattened/ingested.
+
+Multi-account, multi-region; each output row must carry account_id, region, and stable natural IDs.
+
+We compute state_hash as md5(json_format(CAST(row AS JSON))) over salient columns.
+
+Goal
+
+Output CREATE OR REPLACE VIEW statements for each helper view, including all joins/derivations and column lists exactly as specified. Use Athena SQL (Trino dialect). Add comments explaining non-obvious joins and normalization rules.
+
+Views to produce (with exact columns)
+
+vw_vpc_routes
+One row per effective VPC route entry, including subnet-specific association if any.
+Columns:
+
+account_id, region, vpc_id, rtb_id, src_subnet_id (nullable; “ALL” when via main RT),
+
+dest_cidr (ip CIDR), target_type ENUM {IGW,VGW,NATGW,ENI,PCX,TGW_ATTACH,VPCE_IF,VPCE_GW,LOCAL,BLACKHOLE},
+
+target_id (normalized id for target), state ENUM {active,blackhole},
+
+updated_at (timestamp), state_hash (string).
+Requirements:
+
+Resolve route targets with precedence:
+
+gatewayId → IGW (if internet gateway attached) or VGW (virtual private gateway)
+
+natGatewayId → NATGW
+
+networkInterfaceId → ENI (prefer over instanceId; if only instanceId, join to primary ENI)
+
+vpcPeeringConnectionId → PCX
+
+transitGatewayId → TGW_ATTACH by resolving the local VPC’s TGW attachment id
+
+vpcEndpointId of type Gateway → VPCE_GW
+
+Implicit local → emit row with target_type='LOCAL', target_id=vpc_id
+
+Blackhole → target_type='BLACKHOLE', state='blackhole'
+
+Fill src_subnet_id from route_table.associations when association is subnet-scoped; otherwise NULL to mean “applies to all subnets via main”.
+
+vw_tgw_routes
+Columns: account_id, region, tgw_id, tgw_rt_id, dest_cidr, target_attachment_id, blackhole:boolean, updated_at, state_hash.
+
+vw_tgw_assoc
+Columns: account_id, region, tgw_attachment_id, tgw_rt_id, updated_at, state_hash
+Notes: This is the association (exactly one per attachment).
+
+vw_tgw_propagations
+Columns: account_id, region, tgw_attachment_id, tgw_rt_id, updated_at, state_hash
+Notes: Zero or more per attachment; used to validate that an attachment’s routes are visible in a given RT.
+
+vw_eni_effective
+Columns: account_id, region, eni_id, vpc_id, subnet_id, primary_ip, sg_ids ARRAY<VARCHAR>, description, updated_at, state_hash.
+
+vw_sg_rules_expanded
+Explode SG rules; one row per atomic predicate.
+Columns:
+account_id, region, sg_id, dir ENUM{'ingress','egress'}, proto ENUM{'tcp','udp','icmp','all'}, port_low:int, port_high:int, src_kind ENUM{'cidr','sg','prefixList'}, src_value_cidr_or_sg VARCHAR, description, updated_at, state_hash.
+Requirements:
+
+Expand prefix list IDs into constituent CIDRs via a prefix_lists source (assume available), emitting one row per CIDR.
+
+For all protocol, set port_low=0, port_high=65535.
+
+Normalize SG-to-SG references into src_kind='sg' with the referenced sg_id in src_value_cidr_or_sg.
+
+vw_nacl_rules_expanded
+One row per normalized NACL entry.
+Columns:
+account_id, region, nacl_id, vpc_id, dir ENUM{'ingress','egress'}, action ENUM{'allow','deny'}, proto ENUM{'tcp','udp','icmp','all'}, port_low:int, port_high:int, cidr VARCHAR, rule_no:int, is_ephemeral_return:boolean (default false), updated_at, state_hash.
+Notes:
+
+Preserve evaluation order using rule_no (first match wins).
+
+Map AWS -1 protocol to all and compute port ranges accordingly.
+
+All views must:
+
+Use WITH comments to explain tricky joins (e.g., resolving TGW attachment from transitGatewayId).
+
+Compute updated_at from the freshest source field; if absent, use from_iso8601_timestamp(current_timestamp) for now.
+
+Compute state_hash = md5(json_format(CAST(ROW(…) AS JSON))) over salient columns, not including updated_at.
+
+Also include (after the SQL):
+Target Normalization Notes (concise)
+
+Instance-targeted routes: join instanceId → primary ENI to prefer ENI as target.
+
+TGW route normalization: transitGatewayId + (VPC, subnets) → resolve local tgw_attachment_id.
+
+Gateway endpoints: infer VPCE_GW routes via route_table_ids on the endpoint resource.
+
+Interface endpoints: model L3 target as VPCE_IF (further L4 checks use the endpoint ENIs’ SGs).
+
+Output Format
+
+Section A: Assumptions — list the source tables you reference (names + key fields).
+
+Section B: SQL — CREATE OR REPLACE VIEW statements for each view (1–7) with comments.
+
+Section C: Notes — the Target Normalization Notes above.
+
+Section D: Sanity Checks — provide a few Athena queries to validate row counts/joins, e.g.:
+
+“Routes with unknown targets”,
+
+“Subnets without associated RT (should be 0 except transient)”,
+
+“SG rule explosion count vs. original rules”.
+
+Acceptance Criteria
+
+Each view compiles in Athena (Trino dialect) and returns exactly the columns listed.
+
+vw_vpc_routes emits one row per route per RT (with src_subnet_id when subnet-associated; NULL for main).
+
+target_type/target_id/state mapping is unambiguous and covers IGW/VGW/NATGW/ENI/PCX/TGW_ATTACH/VPCE_IF/VPCE_GW/LOCAL/BLACKHOLE.
+
+vw_sg_rules_expanded fully expands prefix lists and SG references.
+
+vw_nacl_rules_expanded preserves rule numbers and maps protocols/ports correctly.
+
+state_hash excludes updated_at and changes only when salient fields change.
+
+Deliverables: Return Sections A–D with full SQL for all seven views and the validation queries.
