@@ -1,13 +1,245 @@
-9) Sanity checks & edge cases
+Prompt to Q — Part 9: Sanity Checks & Edge Cases (Detectors, Queries, Tests, Reporting)
 
-Asymmetric routes (very common!): require VPC‑B route back to TGW/PCX; otherwise you may see one‑way L3 but real traffic fails (NACLs also stateless).
+Role: You are a senior validation engineer. Produce an implementation-ready sanity-check suite for our AWS reachability graph pipeline that detects and explains common edge cases and data pitfalls.
 
-PrefixLists: resolve into CIDR sets during SG evaluation.
+Inputs / Context
 
-Implicit local routes: every VPC RT has a local route to its own CIDR; include it.
+Canonical schema (Part 1), ETL views (Part 2 / Part 6), graph & evaluators (Parts 3–5, 8), and user output contract (Part 7).
 
-Blackhole TGW routes: treat as terminal blocks.
+Athena (Trino) is available for data validation over vw_* views.
 
-Interface endpoints: model their SGs and see if source can reach the VPCE ENIs.
+Graph store is Neptune/openCypher, plus an in-memory NetworkX path engine.
 
-ALB/NLB: if traversing an LB, add checks for listener/target‑group port/proto and LB SG rules.
+We must flag issues before path evaluation (data sanity) and during evaluation (logic sanity).
+
+Goal
+
+Deliver:
+
+Detectors for each listed edge case (asymmetric routes, prefix lists, implicit local, blackholes, VPCE, ALB/NLB).
+
+Athena SQL checks to find problems in normalized views.
+
+Graph consistency queries (openCypher).
+
+Unit tests (Python) with tiny fixtures that trigger each condition.
+
+A reporting format (JSON) with severity levels and remediation hints.
+
+Edge cases to cover (at minimum):
+
+Asymmetric routes (require return route for TGW/PCX).
+
+PrefixLists (expanded to CIDRs in SG evaluation).
+
+Implicit local routes (present in every VPC RT).
+
+Blackhole TGW routes (terminal blocks).
+
+Interface endpoints (VPCE_IF) (ENI+SG checks).
+
+ALB/NLB traversal (listener/target-group proto/port mapping, LB SGs).
+
+Section A — Detector Specs (What each check does & how to compute)
+
+For each detector, provide:
+
+Name, Severity (error|warning|info), Symptom, Detection Logic, Remediation Hint, Output Fields.
+
+A.1 Asymmetric TGW/PCX routes (error)
+
+Logic (high-level): For each source VPC A and dest VPC B, if A has an egress route toward TGW_ATTACH(A) or PCX matching cidr(B), then verify B has a return route back to TGW/PCX matching cidr(A).
+
+Output: {vpcA, rtbA, vpcB, rtbB_missing, flowCidrA, flowCidrB}.
+
+A.2 PrefixList expansion missing (warning)
+
+Logic: Any SG rule in vw_sg_rules_expanded where src_kind='prefixList' should be absent; expansion must have produced cidr rows. If present → warning.
+
+Output: {sgId, dir, proto, portLow, portHigh, prefixListId}.
+
+A.3 Implicit local route missing (error)
+
+Logic: Every RTB must contain a LOCAL route covering its VPC CIDR in vw_vpc_routes. If not present → error.
+
+Output: {rtbId, vpcId, vpcCidr}.
+
+A.4 TGW blackhole present on flow (error/info)
+
+Logic: In vw_tgw_routes, routes with blackhole=true that also match any peer VPC CIDR; flag as error if referenced by any candidate path; otherwise info.
+
+Output: {tgwRtId, destCidr}.
+
+A.5 Interface endpoints missing SG allowance (warning/error)
+
+Logic: For each VPCE_IF, ensure its ENI SGs allow the expected producer/consumer SGs or CIDRs per policy; if a path terminates at VPCE ENI and SG denies → error.
+
+Output: {vpceId, eniId, sgId, missingRule}.
+
+A.6 ALB/NLB traversal mismatch (error)
+
+Logic: If a candidate path includes ALB/NLB, confirm listener protocol/port matches the tested (proto,port), LB SG allows from source, and target-group port/proto reaches targets.
+
+Output: {lbArn, listener, targetGroup, reason}.
+
+Section B — Athena Sanity Queries (Trino)
+
+Provide SQL for each detector:
+
+B.1 Asymmetric TGW (egress present, return missing)
+
+-- VPC A has TGW route to VPC B CIDR, but B lacks return to TGW
+WITH a_to_b AS (
+  SELECT a.account_id a_acct, a.region a_reg, a.vpc_id vpc_a, a.rtb_id rtb_a, b.vpc_id vpc_b, b.cidr vpc_b_cidr
+  FROM vw_vpc_routes a
+  JOIN vw_vpcs b ON a.account_id=b.account_id AND a.region=b.region
+  WHERE a.target_type='TGW_ATTACH' AND contains(iprange(a.dest_cidr), ipaddress(b.cidr)) -- match supernets
+),
+b_return AS (
+  SELECT DISTINCT vpc_id vpc_b, rtb_id rtb_b
+  FROM vw_vpc_routes
+  WHERE target_type='TGW_ATTACH'
+)
+SELECT a_to_b.*
+FROM a_to_b
+LEFT JOIN b_return USING (vpc_b)
+WHERE b_return.rtb_b IS NULL;
+
+
+B.2 PCX asymmetry
+
+-- A routes to PCX toward B CIDR but B lacks matching PCX route back
+WITH pcx_pairs AS (
+  SELECT r1.vpc_id vpc_a, r1.rtb_id rtb_a, r2.vpc_id vpc_b, r2.rtb_id rtb_b
+  FROM vw_vpc_routes r1
+  JOIN vw_vpc_routes r2
+    ON r1.target_type='PCX' AND r2.target_type='PCX'
+   AND r1.target_id = r2.target_id
+)
+SELECT *
+FROM pcx_pairs
+WHERE rtb_b IS NULL; -- refine with CIDR match to vpc_a
+
+
+B.3 Missing LOCAL
+
+SELECT rtb_id, vpc_id
+FROM vw_route_tables rt
+LEFT JOIN vw_vpc_routes r
+  ON rt.rtb_id=r.rtb_id AND r.target_type='LOCAL'
+WHERE r.rtb_id IS NULL;
+
+
+B.4 TGW blackholes
+
+SELECT tgw_rt_id, dest_cidr
+FROM vw_tgw_routes
+WHERE blackhole = true;
+
+
+B.5 PrefixList not expanded
+
+SELECT *
+FROM vw_sg_rules_expanded
+WHERE src_kind='prefixList';
+
+
+B.6 VPCE interface SG gaps (policy-driven; example)
+
+-- Expected: build allows from sg_app to VPCE's SG on 443
+SELECT v.vpce_id, e.sg_id
+FROM vw_vpc_endpoints v
+CROSS JOIN UNNEST(v.sg_ids) AS t(sg_id)
+LEFT JOIN expected_vpce_pairs p ON p.vpce_id=v.vpce_id AND p.required_sg=t.sg_id
+WHERE p.vpce_id IS NULL;
+
+Section C — Graph Consistency (openCypher)
+
+Provide helper queries:
+
+C.1 LOCAL presence per VPC
+
+MATCH (rt:RouteTable)-[r:HAS_ROUTE]->(t)
+WHERE r.targetType='LOCAL'
+RETURN rt.id AS rtb, count(r) AS locals;
+
+
+C.2 TGW blackhole edges
+
+MATCH (:TgwRouteTable)-[r:HAS_ROUTE]->(:TgwAttachment)
+WHERE r.blackhole = true
+RETURN r.destCidr, r;
+
+
+C.3 PCX mutuality
+
+MATCH (rt1:RouteTable)-[r1:HAS_ROUTE {targetType:'PCX'}]->(p:VpcPeering)<- [r2:HAS_ROUTE {targetType:'PCX'}]-(rt2:RouteTable)
+RETURN rt1.id, rt2.id, p.id;
+
+Section D — Unit Tests (Python, minimal fixtures)
+
+Provide small pytest-style tests (or plain asserts) for each detector:
+
+test_asymmetric_tgw(): create routes A→TGW→B without B return; expect detector to flag.
+
+test_prefixlist_expanded(): feed an SG rule containing a prefix list; expect expansion or warning.
+
+test_missing_local(): route table without LOCAL; expect error.
+
+test_tgw_blackhole(): TGW RT blackhole route that matches peer CIDR; expect error.
+
+test_vpce_interface_sg(): endpoint ENI SG missing ingress rule from source SG; expect error.
+
+test_alb_mismatch(): listener tcp/443 but target group on 80; expect error.
+
+Each test returns a structured issue record and asserts issue.severity and issue.code.
+
+Section E — Issue Record & Report Format
+
+Define a JSON schema and example:
+
+{
+  "generator": "sanity-checks/v1",
+  "runAt": "2025-08-16T12:00:00Z",
+  "issues": [
+    {
+      "code": "ASYMMETRIC_TGW",
+      "severity": "error",
+      "summary": "VPC-B missing return route to TGW for 10.0.0.0/16",
+      "evidence": {"vpcA":"...", "rtbA":"...", "vpcB":"...", "expectedRoute":"10.0.0.0/16 -> tgw-attach-b"},
+      "remediation": "Add TGW route in VPC-B RT to 10.0.0.0/16 via tgw-attach-b"
+    }
+  ],
+  "metrics": {"durationMs": 1234}
+}
+
+
+Severity mapping: error blocks path evaluation; warning degrades accuracy; info is advisory.
+
+Section F — Wiring into the Evaluator
+
+Explain how to call detectors:
+
+Pre-flight (Athena + graph checks): run B & C, store issues[].
+
+During evaluation: when reachable() fails, attach closest matching detector (e.g., ASYMMETRIC_TGW).
+
+UI: show a red banner with issue.summary and tooltip linking to remediation.
+
+Section G — Acceptance Criteria
+
+Each listed edge case has a detector spec, Athena query, (optional) Cypher check, and unit test.
+
+Asymmetry detectors consider both TGW and PCX.
+
+PrefixList rules are expanded in vw_sg_rules_expanded; presence of unexpanded entries is flagged.
+
+Implicit LOCAL is enforced.
+
+TGW blackholes are treated as terminal blocks and reported.
+
+VPCE_IF and ALB/NLB traversal have concrete checks tying SG/listener/target-group semantics to the evaluated (proto,port).
+
+Report format is JSON with code, severity, summary, evidence, remediation.
+
+Deliverables: Provide Sections A–G fully, with runnable-style SQL/Cypher snippets and clear detector outputs.
