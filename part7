@@ -1,17 +1,270 @@
-7) Return values for your users (what to show)
+Prompt to Q — Part 7: Return Values & Rendering (User-Facing Output)
 
-For any “show path EC2‑A → EC2‑B on tcp/443”:
+Role: You are the UX+API designer for the reachability tool. Produce an implementation-ready output contract and rendering spec for answers to queries like:
+“Show path EC2-A → EC2-B on tcp/443.”
 
-Decision: reachable or blocked
+Objectives
 
-Path: ordered node IDs (subnets, gateways, tgw attaches, subnets …)
+Return a clear Decision (reachable or blocked), an ordered Path (node IDs), and Why (per-hop evidence: matched route; terminal SG/NACL rules).
 
-Why: for each hop, include:
+Provide outputs that are machine-readable (JSON) and human-friendly (summaries + renderable subgraph for Graphviz/Cytoscape).
 
-Route that matched (rtb_id, dest, target)
+Include multiple path support, error semantics, and minimal fields to reproduce the diagram without re-querying.
 
-SG/NACL rules that allowed/blocked terminal leg (rule numbers/ids, matched predicate)
+Section 1 — Canonical Output JSON (Schemas)
+1.1 Top-level response schema (JSON)
+{
+  "query": {
+    "srcEniId": "string",
+    "dstEniId": "string",
+    "proto": "tcp|udp|icmp|all",
+    "port": 0
+  },
+  "decision": "reachable|blocked",
+  "reasonSummary": "string", 
+  "paths": [
+    {
+      "id": "path-1",
+      "decision": "allowed|blocked",
+      "blockedBy": {
+        "stage": "L3|L4",
+        "type": "NO_ROUTE|BLACKHOLE|ASYMMETRIC|SG_DENY|NACL_DENY",
+        "detail": "string or null"
+      },
+      "nodes": [
+        {"id":"<node-id>","type":"Subnet|RouteTable|TgwAttachment|TgwRouteTable|IGW|NATGW|PCX|VPCE_IF|VPCE_GW|ENI","label":"string"}
+      ],
+      "edges": [
+        {
+          "from":"<node-id>",
+          "to":"<node-id>",
+          "type":"ASSOCIATED_WITH|HAS_ROUTE|ATTACHED_TO|PROPAGATES_TO|PLACED_IN|USES",
+          "attrs":{
+            "destCidr":"string or null",
+            "targetType":"IGW|NATGW|ENI|PCX|TGW_ATTACH|VPCE_IF|VPCE_GW|LOCAL|BLACKHOLE|null",
+            "targetId":"string or null",
+            "state":"active|blackhole|null",
+            "matched": true
+          }
+        }
+      ],
+      "evidence": {
+        "routes": [
+          {
+            "rtbId":"string",
+            "destCidr":"string",
+            "targetType":"IGW|NATGW|ENI|PCX|TGW_ATTACH|VPCE_IF|VPCE_GW|LOCAL|BLACKHOLE",
+            "targetId":"string",
+            "state":"active|blackhole",
+            "hopFrom":"<node-id>",
+            "hopTo":"<node-id>"
+          }
+        ],
+        "security": {
+          "src": {
+            "eniId":"string",
+            "sgEgressMatched":[{"sgId":"string","ruleIdOrIdx":"string","proto":"tcp","portLow":443,"portHigh":443,"srcKind":"cidr|sg|prefixList","srcValue":"string"}],
+            "naclEgressMatched":[{"naclId":"string","ruleNo":110,"action":"allow"}]
+          },
+          "dst": {
+            "eniId":"string",
+            "sgIngressMatched":[{"sgId":"string","ruleIdOrIdx":"string","proto":"tcp","portLow":443,"portHigh":443,"srcKind":"cidr|sg|prefixList","srcValue":"string"}],
+            "naclIngressMatched":[{"naclId":"string","ruleNo":120,"action":"allow"}]
+          }
+        }
+      },
+      "metrics": {
+        "hops": 0,
+        "l3SearchMs": 0,
+        "l4CheckMs": 0
+      }
+    }
+  ],
+  "render": {
+    "style": "graphviz|cytoscape",
+    "legend": {
+      "allowedEdgeColor":"#00AA00",
+      "blockedEdgeColor":"#CC0000",
+      "routeEdge":"solid",
+      "securityBlockedEdge":"dashed"
+    },
+    "annotations":[
+      {"nodeId":"<node-id>","tooltip":"string"},
+      {"edge":{"from":"A","to":"B"},"tooltip":"Matched RTB rtb-123: 10.20.0.0/16 -> tgw-attach-b"}
+    ]
+  },
+  "version":"v1"
+}
 
-Then render a subgraph of those nodes/edges using Graphviz/Cytoscape with:
+1.2 Minimal node/edge ID convention
 
-Green edges for allowed; red with tooltip for the first blocking rule.
+Node id: "{accountId}:{region}:{Label}:{naturalId}" (same as earlier parts).
+
+Edge uniqueness (internal): (from, type, to, qualifier) where qualifier = "{destCidr}#{targetType}#{targetId}" for HAS_ROUTE.
+
+Section 2 — Examples
+2.1 Reachable example (EC2-A → EC2-B via TGW on tcp/443)
+
+Decision: reachable
+
+Why (summary): “Route rtb-A 10.20.0.0/16 → tgw-attach-A; TGW RT-1 10.20.0.0/16 → tgw-attach-B; SG egress (sg-src #45) & SG ingress (sg-dst #12) allow tcp/443; NACLs allow.”
+
+{
+  "decision": "reachable",
+  "reasonSummary": "L3 routes via TGW and terminal L4 rules allow tcp/443.",
+  "paths": [
+    {
+      "id": "path-1",
+      "decision": "allowed",
+      "nodes": [
+        {"id":"...:ENI:eni-a","type":"ENI","label":"ENI-A"},
+        {"id":"...:Subnet:subnet-a","type":"Subnet","label":"Subnet-A"},
+        {"id":"...:RouteTable:rtb-a","type":"RouteTable","label":"RT-A"},
+        {"id":"...:TgwAttachment:tgw-attach-a","type":"TgwAttachment","label":"TGW-Attach-A"},
+        {"id":"...:TgwRouteTable:tgw-rt-1","type":"TgwRouteTable","label":"TGW-RT-1"},
+        {"id":"...:TgwAttachment:tgw-attach-b","type":"TgwAttachment","label":"TGW-Attach-B"},
+        {"id":"...:RouteTable:rtb-b","type":"RouteTable","label":"RT-B"},
+        {"id":"...:Subnet:subnet-b","type":"Subnet","label":"Subnet-B"},
+        {"id":"...:ENI:eni-b","type":"ENI","label":"ENI-B"}
+      ],
+      "edges": [
+        {"from":"...:ENI:eni-a","to":"...:Subnet:subnet-a","type":"PLACED_IN","attrs":{"matched":true}},
+        {"from":"...:Subnet:subnet-a","to":"...:RouteTable:rtb-a","type":"ASSOCIATED_WITH","attrs":{"matched":true}},
+        {"from":"...:RouteTable:rtb-a","to":"...:TgwAttachment:tgw-attach-a","type":"HAS_ROUTE","attrs":{"destCidr":"10.20.0.0/16","targetType":"TGW_ATTACH","targetId":"tgw-attach-a","state":"active","matched":true}},
+        {"from":"...:TgwAttachment:tgw-attach-a","to":"...:TgwRouteTable:tgw-rt-1","type":"ASSOCIATED_WITH","attrs":{"matched":true}},
+        {"from":"...:TgwRouteTable:tgw-rt-1","to":"...:TgwAttachment:tgw-attach-b","type":"HAS_ROUTE","attrs":{"destCidr":"10.20.0.0/16","targetType":null,"targetId":"tgw-attach-b","state":"active","matched":true}},
+        {"from":"...:TgwAttachment:tgw-attach-b","to":"...:RouteTable:rtb-b","type":"ASSOCIATED_WITH","attrs":{"matched":true}},
+        {"from":"...:RouteTable:rtb-b","to":"...:Subnet:subnet-b","type":"HAS_ROUTE","attrs":{"destCidr":"10.20.0.0/16","targetType":"LOCAL","targetId":"vpc-b","state":"active","matched":true}},
+        {"from":"...:Subnet:subnet-b","to":"...:ENI:eni-b","type":"PLACED_IN","attrs":{"matched":true}}
+      ],
+      "evidence": {
+        "routes": [
+          {"rtbId":"rtb-a","destCidr":"10.20.0.0/16","targetType":"TGW_ATTACH","targetId":"tgw-attach-a","state":"active","hopFrom":"...:RouteTable:rtb-a","hopTo":"...:TgwAttachment:tgw-attach-a"},
+          {"tgw_rt_id":"tgw-rt-1","destCidr":"10.20.0.0/16","targetAttachmentId":"tgw-attach-b","blackhole":"false","hopFrom":"...:TgwRouteTable:tgw-rt-1","hopTo":"...:TgwAttachment:tgw-attach-b"}
+        ],
+        "security": {
+          "src": {
+            "eniId":"eni-a",
+            "sgEgressMatched":[{"sgId":"sg-src","ruleIdOrIdx":"45","proto":"tcp","portLow":443,"portHigh":443,"srcKind":"sg","srcValue":"sg-dst"}],
+            "naclEgressMatched":[{"naclId":"acl-a","ruleNo":110,"action":"allow"}]
+          },
+          "dst": {
+            "eniId":"eni-b",
+            "sgIngressMatched":[{"sgId":"sg-dst","ruleIdOrIdx":"12","proto":"tcp","portLow":443,"portHigh":443,"srcKind":"sg","srcValue":"sg-src"}],
+            "naclIngressMatched":[{"naclId":"acl-b","ruleNo":120,"action":"allow"}]
+          }
+        }
+      },
+      "metrics":{"hops":8,"l3SearchMs":7,"l4CheckMs":2}
+    }
+  ]
+}
+
+2.2 Blocked example (asymmetric routing)
+
+Decision: blocked
+
+Why (summary): “No return route in VPC-B to TGW (asymmetric).”
+
+{
+  "decision":"blocked",
+  "reasonSummary":"L3 asymmetric: VPC-B missing route back to TGW for 10.0.0.0/16.",
+  "paths":[
+    {
+      "id":"path-1",
+      "decision":"blocked",
+      "blockedBy":{"stage":"L3","type":"ASYMMETRIC","detail":"rtb-b lacks 10.0.0.0/16 -> tgw"},
+      "nodes":[/* minimal up to failure */],
+      "edges":[/* include last matched route with matched=true, then stop */],
+      "evidence":{"routes":[/* last good hop */],"security":null}
+    }
+  ]
+}
+
+Section 3 — Rendering Specs
+3.1 Graphviz (DOT) snippet template
+
+Green solid edges for allowed hops; red dashed on the first blocking edge.
+
+digraph G {
+  rankdir=LR;
+  node [shape=box, style=rounded];
+  // Nodes
+  "Subnet-A" [label="Subnet-A\n10.0.1.0/24"];
+  "RT-A" [label="RT-A"];
+  "TGW-Attach-A" [label="TGW-Attach-A"];
+  "TGW-RT-1" [label="TGW-RT-1"];
+  "TGW-Attach-B" [label="TGW-Attach-B"];
+  "RT-B" [label="RT-B"];
+  "Subnet-B" [label="Subnet-B\n10.20.1.0/24"];
+  // Edges
+  "Subnet-A" -> "RT-A" [color="#00AA00", label="ASSOCIATED_WITH"];
+  "RT-A" -> "TGW-Attach-A" [color="#00AA00", label="HAS_ROUTE 10.20.0.0/16"];
+  "TGW-Attach-A" -> "TGW-RT-1" [color="#00AA00", label="ASSOCIATED_WITH"];
+  "TGW-RT-1" -> "TGW-Attach-B" [color="#00AA00", label="HAS_ROUTE 10.20.0.0/16"];
+  "TGW-Attach-B" -> "RT-B" [color="#00AA00", label="ASSOCIATED_WITH"];
+  "RT-B" -> "Subnet-B" [color="#00AA00", label="LOCAL"];
+}
+
+3.2 Cytoscape.js elements template
+const elements = {
+  nodes: [
+    { data: { id: "Subnet-A", label: "Subnet-A\n10.0.1.0/24", type: "Subnet" } },
+    { data: { id: "RT-A", label: "RT-A", type: "RouteTable" } },
+    // ...
+  ],
+  edges: [
+    { data: { id: "e1", source: "Subnet-A", target: "RT-A", type: "ASSOCIATED_WITH", allowed: true, tooltip: "Subnet-A assoc RT-A" } },
+    { data: { id: "e2", source: "RT-A", target: "TGW-Attach-A", type: "HAS_ROUTE", allowed: true, tooltip: "rtb-a: 10.20.0.0/16 → tgw-attach-a" } },
+    // ...
+  ]
+};
+
+
+Style rule hints:
+
+edge[allowed = true] { line-color: #00AA00; }
+
+edge[allowed = false] { line-color: #CC0000; line-style: dashed; }
+
+Tooltips from data.tooltip.
+
+Section 4 — User-text Summary (one-liner + bullets)
+
+Return alongside JSON for readability:
+
+One-liner: “ENI-A → TGW → ENI-B reachable on tcp/443; SG (egress#45/ingress#12) + NACL (acl-a#110/acl-b#120) allow.”
+
+Bullets: show the exact route statements and rule IDs that matched.
+
+Section 5 — Multiple Paths & Pagination
+
+Include up to k paths (default 3). Sort by: fewest hops, then least TGW transitions.
+
+If more candidates exist, set meta.morePaths=true and include a cursor or filters (e.g., prefer=privateOnly|preferShortest).
+
+Section 6 — Errors & Edge Cases
+
+Standardize failures:
+
+NO_ROUTE (no L3 path from source subnet),
+
+BLACKHOLE (matched route is blackhole),
+
+ASYMMETRIC (return side missing),
+
+SG_DENY or NACL_DENY (include the first failing rule’s ID/number).
+
+Return HTTP 200 with decision="blocked" and structured blockedBy (avoid 4xx unless request is malformed).
+
+Section 7 — Acceptance Criteria
+
+Output includes Decision, Path nodes/edges (ordered), and Why (routes + SG/NACL evidence).
+
+Rendering specs sufficient to produce Graphviz SVG or Cytoscape graph with green allowed edges and the first blocking edge marked red with a tooltip.
+
+IDs and edge attrs align with Parts 1–6.
+
+Examples validate and can be dropped into the UI with no extra lookups.
+
+Deliverables: Provide the full JSON contract, example payloads (reachable and blocked), DOT/Cytoscape templates, and the summary text rules as specified above.
