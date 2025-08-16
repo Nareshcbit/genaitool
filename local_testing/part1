@@ -1,0 +1,85 @@
+Part 1: Freeze Interfaces (Contracts)
+
+Role: You are a senior backend engineer.
+Produce JSON Schema definitions and a pytest schema validation harness for our AWS reachability graph pipeline.
+
+Requirements
+A) Schemas
+
+Generate three JSON Schemas:
+
+schema/node.schema.json
+
+Properties:
+
+id (string, required) — ARN or synthetic ID
+
+type (enum: Subnet, RouteTable, ENI, SecurityGroup, NACL, IGW, NAT, TGW, TgwAttachment, TgwRouteTable, VpcPeering, VpcEndpoint, LoadBalancer, Rule, etc.)
+
+account (string, optional, AWS account ID)
+
+region (string, optional)
+
+attrs (object, free-form, must allow string/number/boolean values)
+
+Required: id, type
+
+schema/edge.schema.json
+
+Properties:
+
+src (string, required) — node id
+
+dst (string, required) — node id
+
+rel (string, required) — relationship type (ASSOCIATED_WITH, HAS_ROUTE, PROPAGATES_TO, etc.)
+
+attrs (object, free-form, e.g. {dest, target_type, port, proto, state})
+
+Required: src, dst, rel
+
+schema/reachability-response.schema.json
+
+Top-level object with:
+
+decision (enum: reachable, blocked, unknown)
+
+reason (string)
+
+path (array of node IDs in order)
+
+hops (array of objects, each with: from, to, route (rtb_id, dest, target), sgRules (list of matched rule IDs), naclRules (list), notes)
+
+Required: decision, path
+
+All schemas must be Draft 2020-12 compliant.
+
+B) Pytest Harness
+
+Create tests/test_schemas.py that:
+
+Uses jsonschema Python lib.
+
+Parametrizes over sample fixtures in fixtures/nodes.jsonl, fixtures/edges.jsonl, fixtures/reachability.json.
+
+Validates each line/object against the appropriate schema.
+
+Fails tests if any document does not conform.
+
+Prints helpful diffs on failure.
+
+C) CI Command
+
+Provide the single command we will run in CI:
+
+python -m pytest tests/test_schemas.py
+
+D) Deliverables
+
+Complete JSON Schema files (three).
+
+tests/test_schemas.py with parametrized validation code.
+
+Example valid documents for each schema under fixtures/.
+
+Instruction: Generate everything (schemas + pytest code + sample fixture examples) in full — no summaries.
