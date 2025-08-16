@@ -1,17 +1,148 @@
-7) Return values for your users (what to show)
+Prompt to Q — Part 8: Minimal Path Evaluator (Quick Starter)
 
-For any “show path EC2‑A → EC2‑B on tcp/443”:
+Role: You are a senior cloud networking engineer. Produce a compact, runnable Python reference that implements a minimal reachability evaluator for AWS VPC/TGW paths using in-memory data structures. Keep it simple, deterministic, and aligned with Parts 1–7.
 
-Decision: reachable or blocked
+Requirements
 
-Path: ordered node IDs (subnets, gateways, tgw attaches, subnets …)
+Implement the exact function signatures (and semantics) below, with clear docstrings and type hints:
 
-Why: for each hop, include:
+def match_routes(routes, dst_ip): ...
+def next_hops_from_subnet(subnet, dst_ip): ...
+def tgw_hops(from_attach, dst_cidr): ...
+def sg_allows(src_eni, dst_eni, proto, port, src_ip, dst_ip): ...
+def nacl_allows(subnet, dir, proto, port, peer_ip): ...
+def reachable(src_eni, dst_eni, proto, port): ...
 
-Route that matched (rtb_id, dest, target)
+Behavior details to implement
 
-SG/NACL rules that allowed/blocked terminal leg (rule numbers/ids, matched predicate)
+match_routes(routes, dst_ip)
 
-Then render a subgraph of those nodes/edges using Graphviz/Cytoscape with:
+routes: list of dicts {dest_cidr, target_type, target_id, state}.
 
-Green edges for allowed; red with tooltip for the first blocking rule.
+Return only routes where dst_ip ∈ dest_cidr and state != 'blackhole'.
+
+Prefer longest-prefix match ordering.
+
+next_hops_from_subnet(subnet, dst_ip)
+
+subnet.associated_rtb or fall back to subnet.vpc.main_rtb.
+
+Return match_routes(rtb.routes, dst_ip).
+
+tgw_hops(from_attach, dst_cidr)
+
+Use assoc_table[from_attach] -> tgw_rt_id, then tgw_rt_routes[tgw_rt_id].
+
+Return attachments attachB for routes where dst_cidr overlaps (or contains) route dest and blackhole==False.
+
+Respect propagation/association if those sets are provided (e.g., tgw_propag[from_attach] contains the RT).
+
+sg_allows / nacl_allows
+
+Minimal but correct evaluation:
+
+SG: stateful; check source egress and dest ingress allow (proto, port, src/dst). Support cidr and sg refs and proto='all'.
+
+NACL: stateless; ordered by rule_no, first match wins; action ∈ {'allow','deny'}; map -1 protocol to all.
+
+Prefix list expansion can be passed pre-expanded (assume rules already normalized).
+
+reachable(src_eni, dst_eni, proto, port)
+
+Phase 1 (L3): BFS from src_eni.subnet to any node that owns dst_eni.primary_ip, using next_hops_from_subnet and TGW transitions via tgw_hops. Collect the first minimal path (ok to return one).
+
+Phase 2 (L4): Evaluate sg_allows, nacl_allows on terminal legs only:
+
+nacl_allows(src_subnet, "egress", ...) and nacl_allows(dst_subnet, "ingress", ...).
+
+Return (True, "Reachable", path) or (False, "<reason>", path_or_none) with reasons: "No L3 route" | "Security Group block" | "NACL egress block" | "NACL ingress block".
+
+Deliverables (produce ALL)
+A) Minimal data model (TypedDicts / dataclasses)
+
+Define tiny types to keep code self-contained:
+
+Subnet, RouteTable, Route, ENI, SecurityRule, NaclRule
+
+Global indices: assoc_table, tgw_rt_routes, tgw_propag, subnet_to_rtb, eni_index
+
+B) Utility functions
+
+ip_in_cidr(ip, cidr) and longest-prefix sort utility.
+
+Simple prefix-trie or use ipaddress stdlib for containment.
+
+C) Implement the six functions (with docstrings + type hints)
+
+Include small logging/trace hooks (e.g., collect matched route/rule IDs to return as reasons).
+
+Make BFS hop limit configurable (max_hops=12).
+
+D) Return type & path shape
+
+Define a small Path struct:
+
+class Path(TypedDict):
+    nodes: list[str]      # ordered node IDs
+    edges: list[dict]     # {from,to,type,attrs}
+    reasons: list[str]    # human-readable annotations
+
+
+reachable(...) -> tuple[bool, str, Path|None]
+
+E) Tiny test fixture (inline)
+
+Provide a single-file demo with:
+
+VPC-A: Subnet-A, RT-A: 10.20.0.0/16 -> tgw-attach-a
+
+TGW-RT-1: 10.20.0.0/16 -> tgw-attach-b (and tgw_propag shows attach-A visible in RT-1)
+
+VPC-B: Subnet-B, RT-B with LOCAL to 10.20.0.0/16
+
+ENI-A in Subnet-A (SG-src egress 443 to SG-dst), ENI-B in Subnet-B (SG-dst ingress 443 from SG-src)
+
+NACLs allowing corresponding flows
+
+Run:
+
+ok, msg, p = reachable(eni_a, eni_b, "tcp", 443)
+print(ok, msg)
+print(p["nodes"])
+for e in p["edges"]: print(e)
+for r in p["reasons"]: print(r)
+
+F) Blocked case test
+
+Flip one condition (e.g., remove VPC-B back-route or deny SG ingress) and show:
+
+ok, msg, _ = reachable(eni_a, eni_b, "tcp", 443)
+# Expect False with reason "Security Group block" or "No L3 route"
+
+G) Notes & limits
+
+This is a starter: no ALB/NLB modeling, no return-path simulation (optional), no VPCE SG checks unless endpoint is terminal.
+
+Designed to be replaced later by the full engine from Parts 3–5.
+
+Output Format
+
+Deliver a single Python module (one code block) containing:
+
+Types, indices, utilities, function implementations, and the two tests (reachable & blocked) guarded by if __name__ == "__main__":.
+
+Keep under ~250–300 lines, no external deps beyond stdlib ipaddress, dataclasses, typing, collections.
+
+Acceptance Criteria
+
+The module runs as-is (no missing names) and prints the expected outcomes for both tests.
+
+match_routes honors longest-prefix preference and ignores blackholes.
+
+TGW semantics (assoc + propagation + route to attachment) are enforced in tgw_hops.
+
+L4 checks run only at terminal legs.
+
+Reasons include the matched route(s) and rule IDs for allow/deny.
+
+Deliverables: Output the full Python module per sections A–F, followed by short notes (G).
