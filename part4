@@ -1,0 +1,235 @@
+Prompt to Q — Part 4: Path Evaluation Algorithm (Inter-VPC EC2→EC2 via TGW)
+
+Role: You are a senior cloud networking/graph engineer. Using the canonical schema (Part 1) and ETL outputs (Part 2), produce an implementation-ready path evaluation spec and code for:
+
+Phase 1: L3 candidate path search over routing constructs (VPC RTs, TGW assoc/propagation/RTs, PCX, IGW/NAT, VPCE) with dynamic CIDR matching and blackhole pruning.
+
+Phase 2: L4 confirmation using Security Groups (stateful) and NACLs (stateless) only on terminal ENI↔ENI (and LB/VPCE ENIs if traversed).
+
+Inputs / Context
+
+Data comes from Part-2 views (e.g., vw_vpc_routes, vw_tgw_routes, vw_tgw_associations, vw_tgw_propagations, vw_eni_effective, vw_sg_rules_expanded, vw_nacl_rules_expanded, vw_vpc_peerings, vw_vpc_endpoints).
+
+Graph/materialized indices may be in memory (NetworkX + dicts) or in Neptune/Neo4j with openCypher helpers.
+
+Goal
+
+Given: source EC2 i-a (use its primary ENI/IP) in VPC-A:Subnet-A, destination EC2 i-b in VPC-B:Subnet-B, and tuple (proto=tcp, port=443):
+
+Find one or more minimal L3 paths that could carry traffic from ENI-A to ENI-B.
+
+Confirm L4: SG egress (source) + SG ingress (dest) + NACL egress (source subnet) + NACL ingress (dest subnet).
+
+Return reachable?, the best path, and reasons (rules/routes that allowed/blocked).
+
+Output Format (produce ALL sections)
+Section 1 — Required Data Structures & Indices
+
+Define the in-memory shapes you will build (or the equivalent Cypher projections):
+
+subnetToRtb[subnetId] -> rtbId (main/association)
+
+rtbRoutes[rtbId] -> [{destCidr, targetType, targetId, state}] with a prefix trie for CIDR match
+
+tgwAssoc[attachId] -> tgwRtId
+
+tgwPropag[attachId] -> Set<tgwRtId>
+
+tgwRtRoutes[tgwRtId] -> [{destCidr, targetAttachmentId, blackhole}]
+
+pcxPeers[pcxId] -> {vpcA, vpcB}
+
+eniIndex[eniId] -> {subnetId, vpcId, primaryIp, sgIds[]}
+
+sgIngress[sgId] -> [rules], sgEgress[sgId] -> [rules] (normalize proto/ports, expand PrefixLists to CIDRs)
+
+naclBySubnet[subnetId] -> {ingressRules[], egressRules[]} (ordered, first-match-wins)
+
+Include brief JSON type hints for each.
+
+Section 2 — Phase 1: L3 Candidate Path Algorithm (BFS/Dijkstra)
+
+Provide precise pseudocode (and Big-O) implementing the following semantics:
+
+Start node = srcSubnet = eniIndex[srcEni].subnetId, end domain = any node that owns dstIp (usually dstSubnet, then dstEni).
+
+Expansion rules:
+
+Subnet → RouteTable via association (or main).
+
+From RouteTable, expand HAS_ROUTE edges only if dstIp ∈ destCidr and state != 'blackhole'.
+
+For TGW routes (targetType == TGW_ATTACH):
+
+Let attachA = targetId. Find assocRt = tgwAssoc[attachA].
+
+Candidate TGW RTs = tgwPropag[attachA] ∪ {assocRt}.
+
+For each such RT, consider routes where dstIp ∈ destCidr and blackhole = false, yielding attachB = targetAttachmentId.
+
+Only accept if this reflects AWS semantics: propagation/association as above.
+
+From attachB, re-enter VPC-B: ensure VPC-B’s route tables have a route that brings us toward dstSubnet (implicit LOCAL is OK for final hop). If that route is missing → mark asymmetric and prune or annotate failure.
+
+For PCX: permit an inter-VPC hop only if both VPCs have matching routes to the same PCX (note: asymmetry is common → detect and fail).
+
+For VPCE: gateway endpoints are route targets; interface endpoints are L3 targets with ENIs (L4 will later check their SGs).
+
+IGW/NATGW: model as targets as needed (for internet flows; not central to EC2→EC2 over TGW).
+
+Termination: collect minimal paths that reach dstSubnet (and optionally dstEni). Return top-k (e.g., k=3).
+
+Include pseudo-code with function signatures:
+
+find_l3_paths(srcSubnetId, dstIp, k=3, maxHops=12) -> List[Path]
+match_vpc_routes(rtbId, dstIp) -> List[NextHop]
+tgw_next_hops(attachA, dstIp) -> List[AttachB]
+verify_vpc_backroute(vpcIdB, dstIp) -> Bool
+
+Section 3 — Phase 2: L4 Confirmation (SG + NACL)
+
+Provide deterministic evaluators for tuple (srcIp, dstIp, proto, port):
+
+Security Groups (stateful):
+
+egress_allows(srcSgIds, proto, port, dstIp, dstSgIds) returns (bool, matchedRuleIds[])
+
+ingress_allows(dstSgIds, proto, port, srcIp, srcSgIds) returns (bool, matchedRuleIds[])
+
+Handle SG-to-SG references by allowing if source’s egress allows to dst SG and destination’s ingress allows from src SG.
+
+proto=all means any; ports ignored for non-TCP/UDP as per AWS behavior.
+
+NACLs (stateless, ordered by rule number):
+
+nacl_allows(naclRules, direction, proto, port, peerIp) → first-match wins (allow/deny).
+
+Require egress allow on source subnet and ingress allow on destination subnet at minimum; optionally check reverse path for realism.
+
+Only evaluate L4 on terminal leg(s): ENI-A ⇄ ENI-B (and LB/VPCE ENIs if present). No SG/NACL checks inside TGW.
+
+Provide precise pseudocode for these functions and note the need to expand PrefixLists into CIDRs before evaluation.
+
+Section 4 — Integrated reachable() Orchestrator
+
+Define the end-to-end function and result schema:
+
+reachable(srcEniId, dstEniId, proto, port) -> {
+  reachable: bool,
+  bestPath: { nodes: [..], edges: [..] } | null,
+  reasons: [string],            // “why allowed/denied” per hop
+  blockedBy: {                  // present if false
+    stage: 'L3' | 'L4',
+    type: 'NO_ROUTE' | 'BLACKHOLE' | 'ASYMMETRIC' | 'SG_DENY' | 'NACL_DENY',
+    detail: string
+  }
+}
+
+
+Algorithm:
+
+Build/lookup srcSubnet, dstSubnet, srcIp, dstIp.
+
+candidates = find_l3_paths(srcSubnet, dstIp); if none → return reachable=false, blockedBy=NO_ROUTE/ASYMMETRIC/BLACKHOLE with detail.
+
+For each candidate path (ordered by hops), run L4:
+
+SG egress (src), SG ingress (dst), NACL egress (src subnet), NACL ingress (dst subnet).
+
+On first full pass → return reachable=true with reasons listing matched rules (ids/numbers).
+
+If all candidates fail L4 → return reachable=false, blockedBy=SG_DENY/NACL_DENY with the first failing reason.
+
+Section 5 — Python (NetworkX) Reference Snippets
+
+Provide concise, runnable-style code blocks:
+
+Prefix trie for CIDR checks.
+
+find_l3_paths() BFS over G_l3 using edge attrs {destCidr, state, targetType, targetId} and TGW helpers using the indices from Section 1.
+
+SG/NACL evaluators (ingress/egress).
+
+Top-level reachable() composition with a tiny example call.
+
+Section 6 — openCypher Utilities (optional but helpful)
+
+Provide helper queries:
+
+Fetch candidate RT → target expansions from a given Subnet for a :dstIp parameter (note: CIDR match via pre-filtering or custom UDF).
+
+Pull SG/NACL artifacts for the terminal ENIs on a given candidate path.
+
+Section 7 — Edge Cases & Semantics
+
+Explicitly document handling for:
+
+Asymmetric routes (esp. TGW/PCX): require return-side VPC route; else mark ASYMMETRIC.
+
+LOCAL routes (implicit intra-VPC).
+
+BLACKHOLE routes: prune immediately in Phase-1.
+
+Multiple RT associations (subnet-specific vs main).
+
+VPCE: interface endpoints require L4 on endpoint ENIs; gateway endpoints are route-only.
+
+ALB/NLB traversal (if modeled): enforce listener/target-group port mapping and LB SGs.
+
+Large PrefixLists: materialize CIDRs once into a cache.
+
+Section 8 — Performance & Caching
+
+Prebuild tries per RT/TGW RT; memoize (subnet, dstIp) → next-hops.
+
+Cache SG decisions by (frozenset(srcSgIds), frozenset(dstSgIds), proto, port, cidrBucket).
+
+Bound search with maxHops and domain caps (VPC ≤ 4 hops, TGW ≤ 4 hops).
+
+Complexity notes: BFS O(V+E) with prefix-match cost; show how tries reduce per-hop cost.
+
+Section 9 — Tests (must include)
+
+Intra-VPC private→private via LOCAL.
+
+Private→Internet via NATGW.
+
+VPC-A→VPC-B via TGW with correct assoc+propagation+route.
+
+PCX asymmetric: no path (L3 fail).
+
+SG ingress deny (L4 fail).
+
+NACL egress deny (L4 fail).
+
+PrefixList allow on SG ingress.
+
+Section 10 — Worked Example (compact)
+
+Using the exact scenario below, produce:
+
+The L3 path found and the specific routes that matched.
+
+The L4 checks and the rule IDs/numbers that allowed the flow.
+
+Scenario
+
+ENI-A → Subnet-A → RouteTable-A → (route: dst_ip ∈ 10.20.0.0/16 → tgw-attach-A)
+tgw-attach-A → (assoc) tgw-rt-1 → (route: 10.20.0.0/16 → tgw-attach-B)
+tgw-attach-B → VPC-B RouteTable-B (local to 10.20.0.0/16) → Subnet-B → ENI-B
+SG egress on src allows tcp/443 to dst SG; SG ingress on dst allows tcp/443 from src SG
+NACLs on Subnet-A (egress) and Subnet-B (ingress) allow tcp/443
+
+Acceptance Criteria
+
+Phase-1 strictly enforces TGW association/propagation semantics and peering bidirectionality.
+
+Phase-2 only evaluates terminal ENI legs (and LB/VPCE ENIs if traversed).
+
+Asymmetric and blackhole cases return clear reasons.
+
+Python and Cypher snippets align with Parts 1–3 IDs/props.
+
+Output contract is explicit and ready for a UI.
+
+Deliverables: Return Sections 1–10 in order, with pseudocode and concise code blocks where indicated.
