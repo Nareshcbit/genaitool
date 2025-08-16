@@ -1,0 +1,197 @@
+Prompt to Q — Part 2: Local-First Stack (DuckDB + Neo4j + Python)
+
+Role: You are a senior platform engineer.
+Produce a ready-to-run local development stack that lets me run the ETL, load a graph DB, and execute reachability tests entirely on my laptop—no AWS deployment yet.
+
+What to output (complete artifacts)
+A) Project layout
+
+Create a repo layout (show as a tree) and include the files’ full contents afterward:
+
+.
+├─ docker-compose.yml
+├─ .env.neo4j                  # environment variables for Neo4j container
+├─ Makefile
+├─ README.md
+├─ requirements.txt
+├─ pyproject.toml              # or setup.cfg if preferred
+├─ scripts/
+│  ├─ dev_up.sh                # start services (Neo4j)
+│  ├─ dev_down.sh              # stop services
+│  ├─ seed_local_duckdb.py     # create duckdb + views from Parquet/CSV fixtures
+│  └─ load_to_neo4j.py         # load JSONL nodes/edges into Neo4j (openCypher)
+├─ sql/
+│  ├─ duckdb_init.sql          # ATTACH parquet, CREATE VIEW vw_* (Athena-compatible)
+│  └─ sanity_checks.sql        # developer sanity queries
+├─ src/
+│  ├─ etl/
+│  │  ├─ duckdb_client.py      # run SQL over DuckDB; swap to Athena later
+│  │  ├─ build_views.py        # executes sql/duckdb_init.sql
+│  │  └─ export_graph_jsonl.py # reads vw_* and writes nodes.jsonl / edges.jsonl
+│  ├─ loader/
+│  │  ├─ neo4j_client.py       # Bolt driver wrapper
+│  │  └─ upsert_graph.py       # UNWIND MERGE upserts (align Part-5)
+│  ├─ engine/
+│  │  ├─ indices.py            # build in-memory indices from JSONL
+│  │  ├─ reachability.py       # minimal evaluator (Part-8)
+│  │  └─ render_dot.py         # Graphviz DOT render of a subgraph path
+│  └─ utils/
+│     └─ jsonl.py              # read/write helpers; JSON Schema validation hooks
+├─ schema/
+│  ├─ node.schema.json
+│  ├─ edge.schema.json
+│  └─ reachability-response.schema.json
+├─ fixtures/
+│  ├─ parquet/                 # tiny sample parquet or csv to stand in for Describe*
+│  │  ├─ describe-vpcs.parquet
+│  │  ├─ describe-subnets.parquet
+│  │  ├─ describe-route-tables.parquet
+│  │  ├─ describe-network-interfaces.parquet
+│  │  └─ tgw/*.parquet
+│  ├─ expected/
+│  │  ├─ nodes.jsonl
+│  │  ├─ edges.jsonl
+│  │  └─ reachability_output.json
+│  └─ csv/ (if parquet not provided)
+├─ tests/
+│  ├─ test_schemas.py          # Part-1 validation
+│  ├─ test_duckdb_views.py     # views compile & basic counts
+│  ├─ test_loader_neo4j.py     # nodes/edges inserted
+│  └─ test_e2e_reachability.py # runs engine on fixtures
+└─ .gitignore
+
+B) Docker Compose & env
+
+docker-compose.yml (Neo4j 5) exactly like below, plus a healthcheck:
+
+version: "3.9"
+services:
+  neo4j:
+    image: neo4j:5
+    env_file: .env.neo4j
+    ports:
+      - "7474:7474"   # HTTP
+      - "7687:7687"   # Bolt
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - ./.neo4j/data:/data
+      - ./.neo4j/logs:/logs
+
+
+.env.neo4j template with defaults:
+
+NEO4J_AUTH=neo4j/testpassword
+NEO4J_dbms_default__listen__address=0.0.0.0
+NEO4J_server_memory_heap_max__size=1G
+NEO4J_server_memory_pagecache_size=512M
+
+C) Python environment & Makefile
+
+requirements.txt including:
+
+duckdb, pandas, pyarrow, jsonschema, neo4j, networkx, graphviz, pytest, rich
+
+pyproject.toml with pytest config and black/isort (optional).
+
+Makefile targets:
+
+venv, up, down, views, export, load, e2e, sanity, test
+
+D) DuckDB SQL shim
+
+sql/duckdb_init.sql that:
+
+ATTACHes fixtures/parquet (or uses CSV readers),
+
+Creates Athena-like views: vw_vpc_routes, vw_tgw_routes, vw_tgw_assoc, vw_tgw_propagations, vw_eni_effective, vw_sg_rules_expanded, vw_nacl_rules_expanded (mirroring Part-6), with simplified sample columns to run locally.
+
+src/etl/build_views.py runs the SQL file via DuckDB.
+
+src/etl/export_graph_jsonl.py reads the vw_* and writes nodes.jsonl and edges.jsonl under ./out/.
+
+E) Neo4j loader (openCypher)
+
+src/loader/neo4j_client.py: Bolt driver + retry wrapper.
+
+src/loader/upsert_graph.py: idempotent MERGE with UNWIND:
+
+Nodes: Subnet, RouteTable, ENI, SecurityGroup, NetworkAcl, InternetGateway, NatGateway, VpcPeering, TransitGateway, TgwAttachment, TgwRouteTable, VpcEndpoint.
+
+Edges: ASSOCIATED_WITH, HAS_ROUTE, PLACED_IN, USES, ATTACHED_TO, PROPAGATES_TO.
+
+Align field names with your Part-5 templates.
+
+F) Local commands & scripts
+
+scripts/dev_up.sh → docker compose up -d neo4j
+
+scripts/dev_down.sh → docker compose down -v
+
+scripts/seed_local_duckdb.py → create a local DuckDB file ./out/local.duckdb, execute sql/duckdb_init.sql, verify views.
+
+scripts/load_to_neo4j.py → read ./out/nodes.jsonl & ./out/edges.jsonl, push to Neo4j.
+
+G) Tests
+
+tests/test_duckdb_views.py: connect to DuckDB, SELECT count(*) from each vw_*.
+
+tests/test_loader_neo4j.py: after load_to_neo4j.py, run Cypher shape checks (e.g., a path Subnet→RouteTable→NatGateway exists).
+
+tests/test_e2e_reachability.py: use src/engine/reachability.py with fixtures and assert decisions match fixtures/expected/reachability_output.json.
+
+tests/test_schemas.py (from Part-1): validate JSONL and response JSON against schemas.
+
+H) README.md
+
+A concise quickstart with:
+
+make venv
+
+make up
+
+make views (runs DuckDB init)
+
+make export (writes JSONL)
+
+make load (upserts to Neo4j)
+
+make e2e (runs reachability tests)
+
+Troubleshooting tips (port conflicts, Java heap, missing Graphviz).
+
+I) Swap guide (Athena later)
+
+Add a section in README and comments in etl/duckdb_client.py explaining how to switch from DuckDB to Athena:
+
+Abstract a SqlClient interface; keep SQL text identical; change driver in a single place.
+
+Provide placeholders for PyAthena connection strings, workgroup, S3 output.
+
+Acceptance criteria
+
+Running:
+
+make venv && make up && make views && make export && make load && make e2e
+
+
+completes locally without AWS dependencies.
+
+Neo4j shows nodes/edges at http://localhost:7474 (login neo4j / testpassword).
+
+tests/test_duckdb_views.py and tests/test_loader_neo4j.py pass using the fixtures.
+
+The stack is read-only with respect to AWS; all data comes from fixtures/.
+
+Important notes
+
+Keep all SQL in Athena-like dialect, but runnable on DuckDB (use ipaddress functions equivalently or simple placeholders in fixtures).
+
+Keep nodes/edges JSONL shape consistent with Part-1/Part-2 schemas.
+
+Prefer smallest possible fixture datasets (dozens of rows) to keep tests fast.
+
+Deliverables: Provide all files listed above with full contents, not summaries. Include small but realistic fixture rows so tests can run immediatel
