@@ -1,0 +1,189 @@
+Prompt to Q — Part 4: Tests (Unit, Integration, E2E) for Local Stack
+
+Role: You are a senior test engineer. Create a complete pytest test suite and helpers that validate our AWS reachability engine locally (DuckDB + Neo4j + Python), with the exact structure below.
+
+Repository context
+
+ETL & graph code lives under src/ (as in Part 2).
+
+Fixtures from Part 3 exist under fixtures/ (intra_vpc_local, tgw_a_to_b, edge_cases_pack/*).
+
+JSON Schemas from Part 1 sit in schema/.
+
+Neo4j runs via Docker (neo4j:5) at bolt://localhost:7687 with NEO4J_AUTH=neo4j/testpassword.
+
+What to output (create these files with full contents)
+A) Pytest layout (exact paths)
+tests/
+  conftest.py
+  unit/
+    test_routes.py
+    test_sg_nacl.py
+    test_tgw.py
+  integration/
+    test_loader_neo4j.py
+    test_cypher_shapes.py
+  e2e/
+    test_reachability_tgw.py
+    test_edgecases.py
+
+B) Shared fixtures & helpers — tests/conftest.py
+
+Provide:
+
+pytest_addoption flags: --neo4j-uri, --neo4j-user, --neo4j-pass, --skip-integration (bool)
+
+File/dir fixtures:
+
+fixtures_dir → Path("fixtures")
+
+load_jsonl(path) -> list[dict]
+
+load_expected_reachability(path) -> dict
+
+In-memory helpers:
+
+build_indices_from_jsonl(nodes, edges) returning the indices structures the engine expects (subnet→rtb, rtbRoutes, tgwAssoc, tgwPropag, tgwRtRoutes, eniIndex, sgIngress, sgEgress, naclBySubnet).
+
+Neo4j session fixture (scoped to module) that skips if --skip-integration set or server unreachable (nice error).
+
+A small assert_graph_has_shape(tx, cypher, **params) helper.
+
+C) Unit tests
+tests/unit/test_routes.py
+
+Covers route matching:
+
+Longest-prefix wins (e.g., 10.20.0.0/16 vs 10.20.1.0/24).
+
+Ignore state='blackhole'.
+
+Parametrize 3–4 cases. Use the engine’s match_routes or a small shim if needed.
+Assertions: correct candidate ordering; blackholes excluded.
+
+tests/unit/test_sg_nacl.py
+
+Covers SG evaluator & NACL evaluator:
+
+SG: cidr rule allow, sg-ref allow, proto='all' semantics, port range checks.
+
+NACL: first-match-wins; -1 protocol mapped to all; egress & ingress directions.
+
+Include explicit cases for deny-then-allow (should DENY) and allow-then-deny (should ALLOW due to first match).
+Assertions: boolean decisions + matched rule IDs/nums returned.
+
+tests/unit/test_tgw.py
+
+Covers TGW semantics:
+
+Attachment A associated to RT-1; propagation present; RT-1 route to attachment B → allowed hop.
+
+Missing propagation → no hop.
+
+Blackhole route in TGW RT → pruned.
+Assertions: candidate attach IDs match expectations.
+
+D) Integration tests (Neo4j Docker)
+tests/integration/test_loader_neo4j.py
+
+Read fixtures/tgw_a_to_b/nodes.jsonl & edges.jsonl.
+
+Call your loader (src/loader/upsert_graph.py) to MERGE into Neo4j.
+
+Assert node/edge counts roughly match inputs.
+
+Spot-check a few nodes & edges by id.
+
+tests/integration/test_cypher_shapes.py
+
+Run small shape checks against Neo4j, e.g.:
+
+MATCH (s:Subnet)-[:ASSOCIATED_WITH]->(rt:RouteTable)-[r:HAS_ROUTE {targetType:'TGW_ATTACH'}]->(:TgwAttachment)
+RETURN count(*) AS c
+
+
+Validate:
+
+HAS_ROUTE dedup key (rtbId+destCidr+targetType+targetId) results in no duplicates.
+
+At least one LOCAL route exists for each VPC RT used in fixtures.
+Skip both integration tests if --skip-integration or Neo4j not reachable.
+
+E) End-to-end tests
+tests/e2e/test_reachability_tgw.py
+
+Load fixtures/tgw_a_to_b/* JSONL into in-memory indices (don’t require Neo4j here).
+
+Call src/engine/reachability.py:reachable(srcEniId, dstEniId, proto, port).
+
+Compare the full response object to fixtures/tgw_a_to_b/expected_reachability.json (Part-7 schema).
+
+Also call render_dot.py to produce a DOT string, run graphviz.Source(dot).pipe(format="svg"), and assert:
+
+≥ 1 green edge (allowed) and 0 red edges (blocked) in this case (you can count by parsing attributes or using placeholders returned by render).
+
+tests/e2e/test_edgecases.py
+
+For each subfolder under fixtures/edge_cases_pack/ (asymmetric, blackhole, vpce, alb):
+
+Load nodes/edges, build indices, run reachable().
+
+Assert decision="blocked" and blockedBy fields match expected JSON.
+
+For blackhole: ensure first blocking reason contains “BLACKHOLE”.
+
+For asymmetric: contains “ASYMMETRIC”.
+
+For VPCE SG deny: contains “SG_DENY”.
+
+For ALB mismatch: contains listener/target-group or LB SG deny message.
+
+Optional: render DOT and assert at least one red dashed edge.
+
+F) Test utilities (lightweight shims)
+
+If needed, include tiny shims inside tests (or import from src/engine) for:
+
+longest_prefix_sort(cidrs) using ipaddress.
+
+A FakeSubnet, FakeRouteTable, etc., or use dicts consistent with your engine’s expectations.
+
+G) Markers, speed, determinism
+
+Use @pytest.mark.unit, @pytest.mark.integration, @pytest.mark.e2e markers.
+
+Keep all unit tests < 1s total.
+
+Seed any randomness; don’t rely on network access beyond Neo4j for integration.
+
+Skip integration gracefully if Docker Neo4j isn’t up (print a short reason).
+
+H) Running tests
+
+Document (inside a header comment in conftest.py and test modules) the commands:
+
+# unit only
+pytest -m unit -q
+
+# integration (requires Docker neo4j up)
+pytest -m integration -q --neo4j-uri=bolt://localhost:7687 --neo4j-user=neo4j --neo4j-pass=testpassword
+
+# e2e (local in-memory)
+pytest -m e2e -q
+
+# all
+pytest -q
+
+I) Acceptance criteria
+
+Unit: route, SG, NACL, TGW semantics validated with parametrized cases.
+
+Integration: JSONL loads into Neo4j; shape queries pass; dedup works.
+
+E2E: Each fixture’s reachable() output equals expected_reachability.json; DOT render assertions pass.
+
+Tests are hermetic, fast, and runnable on macOS/Linux without AWS access.
+
+Important: Use only stdlib + pytest, neo4j, graphviz, ipaddress. No network calls to AWS.
+
+Deliverables: Provide full file contents for all test files above, including any tiny helpers required for them to run immediately with the Part-2 repo layout.
