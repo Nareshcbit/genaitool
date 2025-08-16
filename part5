@@ -1,0 +1,159 @@
+Prompt to Q — Part 5: Concrete Upsert Patterns (Neptune openCypher + NetworkX)
+
+Role: You are a senior graph platform engineer. Produce production-ready upsert patterns for loading AWS network/security inventory (from Parts 1–2) into:
+
+Option A: Amazon Neptune (openCypher compatible)
+
+Option B: In-memory NetworkX graphs (Python)
+
+Your output must include idempotent MERGEs, batching, parameter conventions, deletions, and small worked examples. You must include the exact Cypher snippets provided below, and expand them into full, reusable templates.
+
+Include verbatim (and expand) these Cypher sketches
+// Subnet
+MERGE (s:Subnet {id:$subnet_id, account:$acct, region:$region})
+SET s.cidr=$cidr, s.az=$az, s.private=$is_private;
+
+// RouteTable + association
+MERGE (rt:RouteTable {id:$rtb_id, account:$acct, region:$region})
+MERGE (s)-[:ASSOCIATED_WITH]->(rt);
+
+// VPC route
+MERGE (rt)-[:HAS_ROUTE {
+  dest:$dest_cidr, target_type:$target_type, target_id:$target_id, state:$state
+}]->(:RoutePlaceholder {id: $rtb_id+"#"+$dest_cidr+"#"+$target_id});
+
+// SG rule (you can also store as properties on SG)
+MERGE (sg:SecurityGroup {id:$sg_id, account:$acct, region:$region})
+MERGE (sg)-[:HAS_RULE {
+  dir:$dir, proto:$proto, low:$low, high:$high, src_kind:$kind, src_value:$value
+}]->(:Rule {id: randomUUID()});
+
+
+And for Option B:
+
+Build G_routing = nx.DiGraph() for L3
+
+Build G_security = structures/functions to evaluate SG/NACL per (src_eni, dst_eni, proto, port, src_ip, dst_ip)
+
+Deliverables (produce all sections)
+Section A — IDs & Parameters
+
+Define node ID format: "{accountId}:{region}:{label}:{naturalId}".
+
+Edge uniqueness: (fromId, type, toId, qualifier) (e.g., qualifier = destCidr#targetType#targetId for routes).
+
+Standardize parameter names:
+
+Nodes: $id, $acct, $region, $props (with updatedAt, stateHash, tags).
+
+Edges: $fromId, $toId, $etype, $eprops.
+
+Section B — Neptune openCypher Upserts (Idempotent)
+
+Expand the provided sketches into UNWIND-based batch templates for:
+
+Nodes: VPC, Subnet, RouteTable, InternetGateway, NatGateway, VpcPeering, ENI, EC2Instance, SecurityGroup, NetworkAcl, TransitGateway, TgwAttachment, TgwRouteTable, VpcEndpoint.
+
+Edges:
+
+Subnet-[:ASSOCIATED_WITH]->RouteTable
+
+RouteTable-[:HAS_ROUTE {destCidr,targetType,targetId,state}]->(Target)
+
+ENI-[:PLACED_IN]->Subnet, ENI-[:USES]->SecurityGroup
+
+VPC-[:ATTACHED]->(IGW|NatGateway|VpcPeering|TgwAttachment)
+
+TgwAttachment-[:ASSOCIATED_WITH|PROPAGATES_TO]->TgwRouteTable
+
+TgwRouteTable-[:HAS_ROUTE {destCidr,targetAttachmentId,blackhole}]->TgwAttachment
+
+Subnet-[:ASSOCIATED_WITH]->NetworkAcl
+
+Ensure MERGE keys are stable and SET includes updatedAt, stateHash.
+
+Provide an example batch:
+
+UNWIND $subnetRows AS row
+MERGE (s:Subnet {id: row.id, account: row.acct, region: row.region})
+SET s += row.props;
+
+
+Show ordering (create nodes, then edges) and retry guidance for late targets.
+
+Section C — NetworkX Upserts (Python)
+
+Provide typed helpers:
+
+from typing import TypedDict, Dict, Any
+import networkx as nx
+
+class NodeRow(TypedDict):
+    id: str; type: str; acct: str; region: str; props: Dict[str, Any]
+
+class EdgeRow(TypedDict):
+    fromId: str; toId: str; type: str; props: Dict[str, Any]
+
+G_l3 = nx.DiGraph()  # routing
+# L4 uses side dicts (SG/NACL) rather than edges
+
+
+Implement upsert_node(G, row) and upsert_edge(G, row) that align to the JSONL from Part 2.
+
+Show how HAS_ROUTE edges carry {destCidr,targetType,targetId,state} and how to store TGW associations/propagations.
+
+Section D — JSONL → Parameter Mapping
+
+Define exact JSONL shapes for nodes and edges (consistent with Parts 1–2).
+
+Map JSONL fields to Cypher parameters and NetworkX attributes.
+
+Include example rows for:
+
+Subnet, RouteTable, NatGateway, ENI, SecurityGroup
+
+Edges: ASSOCIATED_WITH, HAS_ROUTE, PLACED_IN, USES
+
+Section E — Deletions / Tombstones
+
+Strategy 1 (preferred): mark disposition="DELETED" on nodes and soft-delete edges; separate compactor job.
+
+Strategy 2: emit DELETE_NODE / DELETE_EDGE JSONL.
+
+Provide Cypher and NetworkX delete snippets.
+
+Section F — Worked Example (Tiny)
+
+Input JSONL (3–6 rows) → show:
+
+Create Subnet s-a, RouteTable rt-a, NatGateway nat-1
+
+Edge s-a → rt-a (ASSOCIATED_WITH), route rt-a —HAS_ROUTE→ nat-1 (0.0.0.0/0)
+
+ENI eni-x in s-a, eni-x —USES→ sg-1
+
+Provide the exact Cypher batches and NetworkX calls; show a quick verification query and Python check.
+
+Section G — Guardrails & Performance Tips
+
+Dedupe HAS_ROUTE by (rtbId,destCidr,targetType,targetId).
+
+Keep edge props minimal & typed.
+
+Batch size guidance (e.g., 500–2,000 per UNWIND); exponential backoff on transient errors.
+
+Prefer loading targets first, or queue edges to DLQ and replay.
+
+Acceptance Criteria
+
+Includes the verbatim Cypher snippets above, expanded into reusable UNWIND templates.
+
+Upserts are idempotent and align with Part-1 IDs & Part-2 JSONL shapes.
+
+NetworkX helpers rebuild the same topology from the same JSONL.
+
+Clear deletion/tombstone approach.
+
+Worked example runs end-to-end without missing references.
+
+Deliverables: Return Sections A–G fully, with code blocks ready to paste.
