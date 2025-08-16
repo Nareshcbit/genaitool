@@ -1,4 +1,4 @@
-1) Canonical graph schema
+1) Canonical graph schema - a
 Node types (with key properties)
 
 VPC: vpc_id, cidr, dns_hostnames, dns_support
