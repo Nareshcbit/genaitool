@@ -1,0 +1,13 @@
+9) Sanity checks & edge cases
+
+Asymmetric routes (very common!): require VPC‑B route back to TGW/PCX; otherwise you may see one‑way L3 but real traffic fails (NACLs also stateless).
+
+PrefixLists: resolve into CIDR sets during SG evaluation.
+
+Implicit local routes: every VPC RT has a local route to its own CIDR; include it.
+
+Blackhole TGW routes: treat as terminal blocks.
+
+Interface endpoints: model their SGs and see if source can reach the VPCE ENIs.
+
+ALB/NLB: if traversing an LB, add checks for listener/target‑group port/proto and LB SG rules.
