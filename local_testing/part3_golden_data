@@ -1,0 +1,139 @@
+Prompt to Q — Part 3: Golden Test Data (Fixtures for Intra-VPC, TGW, Edge-Cases)
+
+Role: You are a senior test engineer. Create a fixtures/ folder containing 3 tiny, hand-authored scenarios that validate our AWS reachability engine end-to-end. Each scenario must include nodes.jsonl, edges.jsonl, expected_reachability.json (Part-7 schema), and expected_graph.cypher. Keep data minimal (dozens of rows max), human-diffable, and deterministic.
+
+Scope: three scenarios
+1) fixtures/intra_vpc_local/
+
+Story: EC2-A → EC2-B inside the same VPC private subnets; routing is via implicit LOCAL.
+Requirements:
+
+Nodes: VPC, two Subnets, one RouteTable (main), two ENIs, two SGs, one NACL.
+
+Edges: Subnet -> RouteTable (ASSOCIATED_WITH), RouteTable -HAS_ROUTE-> LOCAL, ENI -PLACED_IN-> Subnet, ENI -USES-> SG, Subnet -ASSOCIATED_WITH-> NACL.
+
+Security: SG egress (src) and SG ingress (dst) allow tcp/443; NACL egress/ingress allow.
+
+expected_reachability.json: decision="reachable", one path with LOCAL route evidence and SG/NACL matched rules.
+
+expected_graph.cypher: queries that must return rows, e.g.:
+
+MATCH (:Subnet)-[:ASSOCIATED_WITH]->(:RouteTable)-[r:HAS_ROUTE {targetType:'LOCAL'}]->() RETURN count(r) > 0 AS ok;
+
+2) fixtures/tgw_a_to_b/
+
+Story: EC2-A in VPC-A to EC2-B in VPC-B via TGW (canonical case).
+Requirements:
+
+Nodes: VPC-A, VPC-B, Subnets A/B, RouteTables A/B, TransitGateway, TgwAttachment(A/B), TgwRouteTable(1), ENIs (A/B), SGs (src/dst), NACLs.
+
+Edges:
+
+SubnetA -> RTA (ASSOCIATED_WITH)
+
+RTA -HAS_ROUTE {destCidr: cidr(B), targetType:'TGW_ATTACH', targetId:'tgw-attach-a'}-> TgwAttachment(A)
+
+TgwAttachment(A) -ASSOCIATED_WITH-> TgwRT(1)
+
+TgwRT(1) -HAS_ROUTE {destCidr: cidr(B), targetAttachmentId:'tgw-attach-b', blackhole:false}-> TgwAttachment(B)
+
+TgwAttachment(B) -> (back into VPC-B) represented via RTB -HAS_ROUTE LOCAL to SubnetB
+
+ENI placements and SG uses; Subnet↔NACL.
+
+Security: SG egress(src) to dst SG on 443; SG ingress(dst) from src SG on 443; NACLs allow.
+
+expected_reachability.json: decision="reachable", path includes TGW attach/RT edges; evidence lists matched RTB/TGW routes + SG/NACL rule ids.
+
+expected_graph.cypher: verify TGW linkage:
+
+MATCH (:RouteTable {id:'rtb-a'})-[r:HAS_ROUTE {targetType:'TGW_ATTACH'}]->(:TgwAttachment {id:'tgw-attach-a'}) RETURN count(r)>0 AS ok;
+MATCH (:TgwRouteTable {id:'tgw-rt-1'})-[r:HAS_ROUTE {targetAttachmentId:'tgw-attach-b', blackhole:false}]->(:TgwAttachment {id:'tgw-attach-b'}) RETURN count(r)>0 AS ok;
+
+3) fixtures/edge_cases_pack/
+
+Story: A bundle designed to trigger detectors: asymmetry, TGW blackhole, VPCE interface, ALB path mismatch.
+Requirements (create separate subcases inside or separate expected files):
+
+Asymmetric TGW: A→B has TGW route; B lacks return route. Expected: decision="blocked", blockedBy.stage="L3", type="ASYMMETRIC".
+
+TGW blackhole: TGW RT has blackhole route matching B CIDR. Expected: blockedBy.type="BLACKHOLE".
+
+VPCE interface: Path ends at VPCE_IF ENI whose SG denies from source. Expected: blockedBy.type="SG_DENY", evidence shows VPCE ENI SG rule missing.
+
+ALB mismatch: Path traverses ALB where listener 443 exists but TargetGroup port 80; expected L4 block with reason indicating listener/TG mismatch (or LB SG deny).
+
+Include minimal nodes/edges per subcase; separate expected_reachability.json entries (array) or one per subfolder: asymmetric/, blackhole/, vpce/, alb/.
+
+expected_graph.cypher: one or two checks per subcase (e.g., presence of blackhole TGW route).
+
+File formats to output
+nodes.jsonl
+
+One JSON object per line:
+
+{"type":"Subnet","id":"111111111111:us-east-1:Subnet:subnet-a","acct":"111111111111","region":"us-east-1","props":{"cidr":"10.0.1.0/24","az":"use1-az1","private":true}}
+
+
+(Use the IDs/props consistent with earlier parts: Part-1/2/5.)
+
+edges.jsonl
+{"type":"ASSOCIATED_WITH","fromId":"111111111111:us-east-1:Subnet:subnet-a","toId":"111111111111:us-east-1:RouteTable:rtb-a","props":{}}
+{"type":"HAS_ROUTE","fromId":"...:RouteTable:rtb-a","toId":"...:TgwAttachment:tgw-attach-a","props":{"destCidr":"10.20.0.0/16","targetType":"TGW_ATTACH","targetId":"tgw-attach-a","state":"active"}}
+
+expected_reachability.json
+
+Must conform to Part-7 response schema. Minimal example (reachable):
+
+{
+  "query":{"srcEniId":"...:ENI:eni-a","dstEniId":"...:ENI:eni-b","proto":"tcp","port":443},
+  "decision":"reachable",
+  "reasonSummary":"L3 via TGW; SG/NACL allow 443.",
+  "paths":[
+    {
+      "id":"path-1",
+      "decision":"allowed",
+      "nodes":["...:ENI:eni-a","...:Subnet:subnet-a","...:RouteTable:rtb-a","...:TgwAttachment:tgw-attach-a","...:TgwRouteTable:tgw-rt-1","...:TgwAttachment:tgw-attach-b","...:RouteTable:rtb-b","...:Subnet:subnet-b","...:ENI:eni-b"],
+      "edges":[
+        {"from":"...:Subnet:subnet-a","to":"...:RouteTable:rtb-a","type":"ASSOCIATED_WITH","attrs":{"matched":true}},
+        {"from":"...:RouteTable:rtb-a","to":"...:TgwAttachment:tgw-attach-a","type":"HAS_ROUTE","attrs":{"destCidr":"10.20.0.0/16","targetType":"TGW_ATTACH","targetId":"tgw-attach-a","state":"active","matched":true}}
+      ],
+      "evidence":{
+        "routes":[{"rtbId":"rtb-a","destCidr":"10.20.0.0/16","targetType":"TGW_ATTACH","targetId":"tgw-attach-a","state":"active"}],
+        "security":{
+          "src":{"eniId":"eni-a","sgEgressMatched":[{"sgId":"sg-src","ruleIdOrIdx":"45","proto":"tcp","portLow":443,"portHigh":443,"srcKind":"sg","srcValue":"sg-dst"}],"naclEgressMatched":[{"naclId":"acl-a","ruleNo":110,"action":"allow"}]},
+          "dst":{"eniId":"eni-b","sgIngressMatched":[{"sgId":"sg-dst","ruleIdOrIdx":"12","proto":"tcp","portLow":443,"portHigh":443,"srcKind":"sg","srcValue":"sg-src"}],"naclIngressMatched":[{"naclId":"acl-b","ruleNo":120,"action":"allow"}]}
+        }
+      },
+      "metrics":{"hops":8,"l3SearchMs":7,"l4CheckMs":2}
+    }
+  ],
+  "render":{"style":"graphviz","legend":{"allowedEdgeColor":"#00AA00","blockedEdgeColor":"#CC0000","routeEdge":"solid","securityBlockedEdge":"dashed"}}
+}
+
+expected_graph.cypher
+
+A handful of assertions (each should return at least one row/TRUE). Example:
+
+MATCH (s:Subnet)-[:ASSOCIATED_WITH]->(rt:RouteTable)-[r:HAS_ROUTE]->(t)
+RETURN count(*) >= 1 AS ok;
+
+Extra: tiny seed CSV/Parquet (optional)
+
+If helpful, also emit minimal CSVs in each scenario (subnets.csv, route_tables.csv, …) that align to your ETL; but nodes.jsonl / edges.jsonl are the source of truth for the fixtures.
+
+Acceptance criteria
+
+Each scenario folder contains all four files and stays under ~30 JSONL lines combined.
+
+IDs follow "{accountId}:{region}:{Label}:{naturalId}".
+
+Route edges use HAS_ROUTE with {destCidr,targetType,targetId,state}.
+
+TGW scenario includes correct association/propagation semantics (A attach associated to RT-1; RT-1 has route to B attach; blackhole=false).
+
+Edge-case pack includes at least: one ASYMMETRIC block, one BLACKHOLE block, one VPCE_IF SG_DENY, one ALB mismatch.
+
+All expected_reachability.json files validate against the Part-7 schema.
+
+Deliverables: Output the full contents for every file listed above (populate concrete IDs and small data), ready to commit under fixtures/.
