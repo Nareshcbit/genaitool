@@ -1,0 +1,164 @@
+Prompt to Q — LLM-only Reachability from eni-a → eni-b using nodes.json + events.json
+
+Role: You are a senior cloud network analyst.
+Task: Using only the two attached files—nodes.json and events.json—construct an in-memory property graph of AWS networking/security resources and determine whether traffic from eni-a can reach eni-b on a specified 5-tuple. Do not call external APIs or assume resources not present in the files.
+
+I will attach:
+
+nodes.json — array of node objects
+
+events.json — array of edge objects (if my file is named edges.json instead, treat it as the same)
+
+0) Inputs you will receive
+
+Transport tuple: "proto" (tcp|udp|icmp|all) and "port" (integer; 0 if N/A).
+
+Source/Destination ENIs: "srcEniId", "dstEniId".
+
+nodes.json schema (expected):
+
+{
+  "id": "123456789012:us-east-1:Subnet:subnet-aaaa",
+  "type": "Subnet|RouteTable|ENI|SecurityGroup|NetworkAcl|InternetGateway|NatGateway|VpcPeering|TransitGateway|TgwAttachment|TgwRouteTable|VpcEndpoint|PrefixList|Rule",
+  "account": "123456789012",
+  "region": "us-east-1",
+  "attrs": { "cidr": "10.0.1.0/24", "az":"use1-az1", "private": true, "...": "..." }
+}
+
+
+events.json schema (expected):
+
+{
+  "src": "<node-id>", "dst": "<node-id>",
+  "rel": "ASSOCIATED_WITH|HAS_ROUTE|PROPAGATES_TO|ATTACHED_TO|PLACED_IN|USES",
+  "attrs": { "destCidr":"10.20.0.0/16", "targetType":"TGW_ATTACH|NATGW|ENI|PCX|IGW|LOCAL|VPCE_IF|VPCE_GW|VGW|BLACKHOLE",
+             "targetId":"...", "state":"active|blackhole", "dir":"ingress|egress",
+             "proto":"tcp|udp|icmp|all", "portLow":0, "portHigh":65535,
+             "srcKind":"cidr|sg|prefixList", "srcValue":"...", "ruleNo":110, "action":"allow|deny" }
+}
+
+
+If a required field is missing, explicitly say which one and proceed as far as possible without inventing data.
+
+1) Build the graph (LLM-internal, no code execution required)
+
+Treat each nodes.json item as a vertex keyed by id with label = type and attributes = attrs.
+
+Treat each events.json item as a directed edge from src → dst with label = rel and attributes = attrs.
+
+Canonical relationships you must recognize:
+
+Subnet -ASSOCIATED_WITH-> RouteTable
+
+RouteTable -HAS_ROUTE{destCidr,targetType,targetId,state}-> (Target) where Target is one of IGW,NATGW,ENI,PCX,TGW_ATTACH,VPCE_IF,VPCE_GW,VGW,LOCAL
+
+ENI -PLACED_IN-> Subnet
+
+ENI -USES-> SecurityGroup
+
+Subnet -ASSOCIATED_WITH-> NetworkAcl
+
+TgwAttachment -ASSOCIATED_WITH/PROPAGATES_TO-> TgwRouteTable
+
+TgwRouteTable -HAS_ROUTE{destCidr,targetAttachmentId,blackhole}-> TgwAttachment
+
+If the file is named edges.json, treat it identically to events.json.
+
+2) Semantics to apply (deterministic)
+L3 (routing) rules
+
+Start from srcEniId → its Subnet → associated RouteTable.
+
+From each RouteTable, expand only HAS_ROUTE where dstIp ∈ destCidr and state != 'blackhole'.
+
+TGW: From a TGW_ATTACH(A) target, allow a hop to TgwRouteTable if there is ASSOCIATED_WITH (the one) and/or PROPAGATES_TO edges to that table. From the TgwRouteTable, hop to TgwAttachment(B) via HAS_ROUTE{destCidr matches dst, blackhole=false}.
+
+After TgwAttachment(B), return to VPC-B’s side: ensure a path to dstSubnet exists (LOCAL acceptable).
+
+PCX: allow inter-VPC hop only if both sides have HAS_ROUTE to the same PCX; otherwise mark ASYMMETRIC.
+
+VPCE: gateway endpoints behave as RT targets only; interface endpoints terminate at VPCE ENIs (L4 checks apply there).
+
+LOCAL: implicit intra-VPC route; if modeled explicitly, use it; otherwise assume it if the VPC CIDR contains dst.
+
+L4 (filters) on terminal legs only
+
+Security Groups (stateful): require egress allow on source ENI’s SGs and ingress allow on destination ENI’s SGs for (proto,port) and (src/dst) via cidr or sg ref. proto='all' means any; ports ignored for non-TCP/UDP. Expand PrefixLists to CIDRs if provided.
+
+NACLs (stateless, ordered): require egress allow on source subnet and ingress allow on dest subnet (first-match-wins by ruleNo).
+
+No SG/NACL checks inside TGW. If a load balancer or VPCE interface ENI is the terminal hop, include its SGs.
+
+Edge cases to detect
+
+ASYMMETRIC (no return route at dest VPC).
+
+BLACKHOLE routes (VPC or TGW) → terminal block at L3.
+
+Missing associations/propagations for TGW preventing hop.
+
+VPCE_IF SG deny.
+
+ALB/NLB listener/target-group mismatch (if nodes/edges for LBs are present).
+
+3) What to output
+
+Produce all three artifacts below—no extra commentary.
+
+(A) One-line verdict
+
+“eni-a → eni-b reachable on <proto>/<port>” or “blocked: <reason>”.
+
+(B) Canonical JSON result (must match this shape)
+{
+  "query": {"srcEniId":"eni-a","dstEniId":"eni-b","proto":"tcp","port":443},
+  "decision": "reachable|blocked",
+  "reasonSummary": "string",
+  "paths": [
+    {
+      "id": "path-1",
+      "decision": "allowed|blocked",
+      "blockedBy": {"stage":"L3|L4","type":"NO_ROUTE|BLACKHOLE|ASYMMETRIC|SG_DENY|NACL_DENY","detail":"string|null"},
+      "nodes": [{"id":"<node-id>","type":"<label>","label":"<short>"}],
+      "edges": [{"from":"<id>","to":"<id>","type":"ASSOCIATED_WITH|HAS_ROUTE|...","attrs":{"destCidr": "...","targetType":"...","targetId":"...","state":"active|blackhole","matched":true}}],
+      "evidence": {
+        "routes": [{"rtbId":"...","destCidr":"...","targetType":"...","targetId":"...","state":"active|blackhole","hopFrom":"<id>","hopTo":"<id>"}],
+        "security": {
+          "src": {"eniId":"eni-a","sgEgressMatched":[{"sgId":"...","ruleIdOrIdx":"...","proto":"tcp","portLow":443,"portHigh":443,"srcKind":"cidr|sg|prefixList","srcValue":"..."}],"naclEgressMatched":[{"naclId":"...","ruleNo":110,"action":"allow"}]},
+          "dst": {"eniId":"eni-b","sgIngressMatched":[{"sgId":"...","ruleIdOrIdx":"...","proto":"tcp","portLow":443,"portHigh":443,"srcKind":"cidr|sg|prefixList","srcValue":"..."}],"naclIngressMatched":[{"naclId":"...","ruleNo":120,"action":"allow"}]}
+        }
+      },
+      "metrics": {"hops":0,"l3SearchSteps":0}
+    }
+  ],
+  "version":"v1"
+}
+
+(C) Tiny DOT subgraph (optional but preferred)
+
+Graphviz DOT representing the nodes/edges of the best path.
+
+Use green solid edges for allowed hops; red dashed on the first blocking hop with a tooltip explaining why.
+
+4) Constraints & quality checks
+
+Use only the attached files. If an input needed for a decision is missing (e.g., SG rules), say so in reasonSummary and return the safest determination you can (usually “blocked: insufficient data”).
+
+Prefer longest-prefix matches for destCidr. Ignore HAS_ROUTE edges marked state='blackhole'.
+
+Treat SG/NACL precedence correctly: SGs are stateful (both egress+ingress must allow); NACLs are stateless + ordered (first match wins).
+
+Detect asymmetry by checking for a valid reverse route at the destination VPC (based on provided edges).
+
+Don’t hallucinate intermediate resources; if TGW propagation/association edges are missing, you may not traverse the TGW.
+
+If multiple candidate L3 paths exist, return up to 3 shortest (fewest hops), and attempt L4 confirmation in that order.
+
+5) Inputs to expect right now (fill these into the query block)
+srcEniId = "eni-a"
+dstEniId = "eni-b"
+proto    = "tcp"
+port     = 443
+
+
+Action: Read the two attachments now, build the in-memory graph, evaluate reachability per the rules above, and return artifacts (A), (B), (C) exactly in that order. If any required fields are missing from the inputs, call them out precisely in the JSON reasonSummary, then proceed conservatively.
