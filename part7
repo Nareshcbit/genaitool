@@ -1,0 +1,17 @@
+7) Return values for your users (what to show)
+
+For any “show path EC2‑A → EC2‑B on tcp/443”:
+
+Decision: reachable or blocked
+
+Path: ordered node IDs (subnets, gateways, tgw attaches, subnets …)
+
+Why: for each hop, include:
+
+Route that matched (rtb_id, dest, target)
+
+SG/NACL rules that allowed/blocked terminal leg (rule numbers/ids, matched predicate)
+
+Then render a subgraph of those nodes/edges using Graphviz/Cytoscape with:
+
+Green edges for allowed; red with tooltip for the first blocking rule.
