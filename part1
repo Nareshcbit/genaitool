@@ -1,0 +1,147 @@
+Part 1
+
+Prompt to Q — Build Canonical Graph Schema for AWS Network/Security Inventory
+
+Role: You are a senior cloud graph modeler. Create a canonical, implementation‑ready property‑graph schema for visualizing AWS networking & security reachability across multi‑account, multi‑region environments.
+
+Inputs / Context
+
+I have enriched inventory for AWS resources (from Resource Explorer + Describe* calls) in S3/Parquet with Glue/Athena views.
+
+I will load this data into a graph to compute network paths and render diagrams (Reachability‑like).
+
+I need a schema that works with either Amazon Neptune (openCypher), Neo4j (Cypher), or in‑memory NetworkX.
+
+Goal
+
+Produce a canonical graph schema with:
+
+Node types + required properties (strongly typed),
+
+Edge types + direction + properties,
+
+ID strategy (compound keys: account_id, region, natural IDs),
+
+Normalization guidance (when to store rules as nodes vs edge props),
+
+Ready‑to‑use artifacts:
+
+(A) JSON Schema for nodes & edges (validation),
+
+(B) Cypher upsert templates (MERGE statements) for loader code,
+
+(C) Minimal NetworkX construction hints (Python type hints).
+
+Scope (must cover at least)
+
+VPC, Subnet, RouteTable, Route, InternetGateway, NatGateway, VpcPeering
+
+TransitGateway, TgwAttachment, TgwRouteTable, TgwRoute, TGW associations/propagations
+
+NetworkAcl + NaclRule
+
+SecurityGroup + SgRule (including SG‑to‑SG references & PrefixLists)
+
+ENI, EC2 Instance
+
+VpcEndpoint (interface & gateway) and its SGs
+
+(Optional but nice): ALB/NLB, TargetGroup, EKSCluster, PodENI
+
+Required Model Decisions
+
+Node vs Edge props:
+
+Treat Route, SgRule, NaclRule as edge properties by default for runtime speed; include an alternative where they are nodes if graph DB requires.
+
+Directionality:
+
+Edges point from source to target in the traffic sense where applicable (e.g., Subnet -> RouteTable, RouteTable -HAS_ROUTE-> Target).
+
+Time & change:
+
+Include updated_at and state_hash on all nodes; edges should have an source_snapshot_at where feasible.
+
+Naming & Types
+
+Use camelCase for property names; explicit types (string, boolean, enum, ipCidr, int, list<string>, map<string,string>).
+
+Enumerations for: route.targetType ∈ {IGW,NATGW,ENI,TGW_ATTACH,PCX,VPCE_IF,VPCE_GW,VGW,LOCAL,BLACKHOLE}; sgRule.dir ∈ {ingress,egress}; proto ∈ {tcp,udp,icmp,all}.
+
+IPs/CIDRs must be typed as ipCidr or ipAddress in JSON Schema.
+
+Output Format (produce all three sections)
+Section 1 — Canon schema (human‑readable)
+
+A concise table/list of Node types with required properties.
+
+A concise table/list of Edge types with direction and properties.
+
+Include ID strategy per node and per edge (e.g., id = "{account}:{region}:{type}:{naturalId}").
+
+Specify which edges are derived (e.g., TGW attach → RT via association; TGW path eligibility via propagation).
+
+Section 2 — JSON Schemas
+
+Provide two JSON Schema documents:
+
+NodeSchema.json (a union via oneOf for each node label)
+
+EdgeSchema.json (a union via oneOf for each edge type)
+Each must define:
+
+type, id, accountId, region, properties{...}, labels[string[]] for nodes
+
+type, fromId, toId, properties{...} for edges
+
+Patterns/regex for ARNs and IDs where known (e.g., ^eni-[0-9a-f]+$)
+
+Section 3 — Loader templates (ready to paste)
+
+Cypher MERGE templates for each major node/edge type (Neptune openCypher compatible).
+
+Example: Subnet, RouteTable, HAS_ROUTE, ENI -IN_SUBNET-> Subnet, ENI -USES-> SecurityGroup, Subnet -ASSOCIATED_WITH-> RouteTable, TgwAttachment -ASSOCIATED_WITH-> TgwRouteTable, TgwRouteTable -HAS_ROUTE-> (route as edge props), etc.
+
+NetworkX hints
+
+Python type hints for a minimal add_node/add_edge function per type, and attribute dict layouts.
+
+Acceptance Criteria (Q must satisfy)
+
+Covers all scope items above with required properties sufficient for L3 routing and L4 filtering.
+
+Explicit edge directions and property names are consistent across sections.
+
+Provides ID patterns and compound keys that avoid collisions across accounts/regions.
+
+Cypher upserts are idempotent (use MERGE on stable keys).
+
+JSON Schema validates property types (CIDRs, booleans, enums).
+
+Includes notes for alternate modeling where rules are nodes.
+
+Short worked example: show the nodes/edges that would be created for:
+
+One VPC with 2 subnets, 1 route table (local + default to NATGW), 1 ENI with 1 SG (ingress 443 from SG‑X), and a TGW attachment associated to a TGW route table with a route to another attachment.
+
+Example property sets (for Q to include as defaults)
+
+Subnet: id, vpcId, az, cidr, isPrivate:boolean, routeTableId, naclId, tags{}
+
+SecurityGroup: id, vpcId, tags{}, ruleCount:int
+
+SgRule (edge props): dir, proto, portMin, portMax, srcKind:{cidr,sg,prefixList}, srcValue, description
+
+Route (edge props): destCidr, targetType, targetId, state:{active,blackhole}, routeTableId
+
+TgwAttachment: id, tgwId, vpcId, subnetIds[], accountId, region
+
+TgwRoute (edge props): destCidr, targetAttachmentId, blackhole:boolean
+
+Non‑Goals (to keep Q focused)
+
+No L7 app modeling, no IAM policy evaluation, no Kubernetes policy modeling (yet).
+
+Do not generate ingestion code or queries—only the schema and upsert templates.
+
+Deliverables: Return Section 1, Section 2, Section 3 as described. Keep it concise and copy‑pasteable.
