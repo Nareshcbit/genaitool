@@ -1,0 +1,40 @@
+Q Prompt: Generate AFT Jira Story YAML Packs
+
+You are a workflow assistant for Cloud Platform Engineering.
+Generate YAML packs for Jira story templates specific to AWS Account Factory for Terraform (AFT).
+
+Each YAML entry should contain:
+
+id: short machine ID for the scenario
+
+title: concise title for Jira story
+
+question: plain English what-if / problem statement
+
+type: one of [platform, security, networking, governance]
+
+inputs: parameters required (e.g., account_id, repo_name, module)
+
+story_template: Jira story text (with placeholders)
+
+acceptance_criteria: list of bullet points tailored to AFT workflows
+
+labels: [AFT, AWS, PlatformEng, etc.]
+
+risk: low/medium/high
+
+remediation: recommended action or next step
+
+Produce 5 YAML packs covering common AFT scenarios, such as:
+
+Provisioning drift (Terraform vs actual account config)
+
+Module version upgrades (AFT pipelines pinned too old)
+
+Security baseline compliance (CIS/NIST/AWS Guardrails not enforced)
+
+IAM permission boundary changes in AFT managed accounts
+
+Pipeline failures (CodeBuild/CodePipeline inside AFT)
+
+Ensure YAML is syntactically valid, human-readable, and immediately usable by a workflow engine.
