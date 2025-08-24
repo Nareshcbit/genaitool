@@ -1,0 +1,678 @@
+awesome — here’s a clean, path-tracing–friendly way to model all VPC networking in a single node, and likewise a single TGW node. These schemas are compact but complete enough for deterministic path finding (routes → next hops → fabrics) and for policy checks (SG/NACL live off ENIs/Subnets but are referenced here so you can jump out when you need them).
+
+I’ve given you:
+
+a canonical JSON shape (field names, types, requireds)
+
+why each section exists (what the path tracer will use it for)
+
+small examples so you can see the shape in the wild
+
+VPC super-node (single node for an entire VPC)
+{
+  "id": "vpc-xxxxxxxx",
+  "type": "vpc",
+  "version": "1.0",
+  "account_id": "123456789012",
+  "region": "us-east-1",
+  "name": "prod-vpc",
+  "tags": { "Environment": "prod" },
+
+  "cidrs": {
+    "ipv4": ["10.16.0.0/16"],
+    "ipv6": []
+  },
+  "features": {
+    "dns_hostnames": true,
+    "dns_support": true,
+    "tenancy": "default"
+  },
+
+  "associations": {
+    "subnets": [
+      {
+        "id": "subnet-aaa1",
+        "az": "us-east-1a",
+        "cidr": "10.16.1.0/24",
+        "map_public_ip_on_launch": false,
+        "nacl_id": "acl-11",
+        "route_table_id": "rtb-main",
+        "tags": {}
+      },
+      {
+        "id": "subnet-bbb1",
+        "az": "us-east-1b",
+        "cidr": "10.16.2.0/24",
+        "map_public_ip_on_launch": false,
+        "nacl_id": "acl-12",
+        "route_table_id": "rtb-app",
+        "tags": {}
+      }
+    ],
+
+    "route_tables": [
+      {
+        "id": "rtb-main",
+        "is_main": true,
+        "routes": [
+          {
+            "destination": "10.16.0.0/16",
+            "target_type": "local",
+            "target_id": null,
+            "blackhole": false
+          },
+          {
+            "destination": "0.0.0.0/0",
+            "target_type": "igw",
+            "target_id": "igw-1",
+            "blackhole": false
+          }
+        ],
+        "associations": {
+          "explicit_subnet_ids": ["subnet-aaa1"],
+          "main_for_vpc": true
+        }
+      },
+      {
+        "id": "rtb-app",
+        "is_main": false,
+        "routes": [
+          {
+            "destination": "10.32.0.0/16",
+            "target_type": "tgw-attachment",
+            "target_id": "tgw-attach-9",
+            "blackhole": false
+          },
+          {
+            "destination": "0.0.0.0/0",
+            "target_type": "natgw",
+            "target_id": "nat-2",
+            "blackhole": false
+          }
+        ],
+        "associations": { "explicit_subnet_ids": ["subnet-bbb1"], "main_for_vpc": false }
+      }
+    ],
+
+    "internet_gateway": { "id": "igw-1", "attached": true },
+    "egress_only_igw": null,
+
+    "nat_gateways": [
+      {
+        "id": "nat-2",
+        "subnet_id": "subnet-aaa1",
+        "az": "us-east-1a",
+        "eips": ["203.0.113.10"],
+        "state": "available"
+      }
+    ],
+
+    "vpc_endpoints": {
+      "gateway": [
+        { "id": "vpce-gw-1", "service": "com.amazonaws.us-east-1.s3", "route_table_ids": ["rtb-app"] }
+      ],
+      "interface": [
+        { "id": "vpce-if-1", "service": "com.amazonaws.us-east-1.secretsmanager", "eni_ids": ["eni-vpce1a","eni-vpce1b"], "subnet_ids": ["subnet-bbb1"] }
+      ]
+    },
+
+    "vpn_gateways": [
+      { "id": "vgw-1", "attached": true, "vpn_connections": ["vpn-aaa","vpn-bbb"] }
+    ],
+    "dx_gateways": [],
+
+    "peering_connections": [
+      { "id": "pcx-123", "peer_vpc_id": "vpc-YYYYYYYY", "status": "active", "route_table_ids": ["rtb-app"] }
+    ],
+
+    "tgw_attachments": [
+      {
+        "id": "tgw-attach-9",
+        "tgw_id": "tgw-zzzz",
+        "subnet_ids": ["subnet-bbb1"],
+        "appliance_mode_support": "disable",
+        "association_route_table_id": "tgw-rt-1",
+        "propagation_route_table_ids": ["tgw-rt-1"]
+      }
+    ],
+
+    "security_groups": {
+      "default_sg_id": "sg-default",
+      "sg_ids": ["sg-web","sg-app","sg-db"]
+      /* optional: you can include full rules elsewhere; keep IDs here for jumping */
+    },
+
+    "network_acls": {
+      "default_acl_id": "acl-11",
+      "acl_ids": ["acl-11","acl-12"]
+    },
+
+    "dhcp_options": { "id": "dopt-1" },
+    "flow_logs": [{ "id": "fl-1", "dest": "cloudwatch", "status": "ACTIVE" }]
+  },
+
+  "computed": {
+    "subnet_to_rtb": { "subnet-aaa1": "rtb-main", "subnet-bbb1": "rtb-app" },
+    "rtb_to_subnets": { "rtb-main": ["subnet-aaa1"], "rtb-app": ["subnet-bbb1"] },
+    "internet_border": {
+      "igw_id": "igw-1",
+      "natgw_by_az": { "us-east-1a": ["nat-2"] }
+    }
+  }
+}
+
+Why these fields matter (path tracing):
+
+route_tables.routes[]: longest-prefix match → next hop (target_type, target_id).
+
+subnet_to_rtb: pick the associated RT for a source subnet.
+
+igw / natgw / vpc_endpoints / peering / tgw_attachments: the hop types you’ll traverse after the route decision.
+
+security_groups / network_acls: fast pointers so you can jump to SG/NACL nodes when evaluating policy.
+
+vpn/dx: on-prem paths (if your tracer includes VGW/DX flows).
+
+TGW super-node (single node for an entire Transit Gateway)
+{
+  "id": "tgw-zzzz",
+  "type": "tgw",
+  "version": "1.0",
+  "account_id": "123456789012",
+  "region": "us-east-1",
+  "asn": 64512,
+  "state": "available",
+  "tags": { "Name": "core-backbone" },
+
+  "attachments": [
+    {
+      "id": "tgw-attach-9",
+      "attachment_type": "vpc",                      // vpc | vpn | dxgw | peering
+      "owner_account_id": "123456789012",
+      "resource_id": "vpc-xxxxxxxx",
+      "subnet_ids": ["subnet-bbb1"],                 // for VPC attachments
+      "subnet_azs": ["us-east-1b"],
+      "association_route_table_id": "tgw-rt-1",
+      "propagation_route_table_ids": ["tgw-rt-1"],
+      "appliance_mode_support": "disable",
+      "state": "available",
+      "tags": {}
+    },
+    {
+      "id": "tgw-attach-vpn1",
+      "attachment_type": "vpn",
+      "owner_account_id": "123456789012",
+      "resource_id": "vpn-aaa",
+      "association_route_table_id": "tgw-rt-1",
+      "propagation_route_table_ids": ["tgw-rt-1"],
+      "state": "available"
+    }
+  ],
+
+  "route_tables": [
+    {
+      "id": "tgw-rt-1",
+      "is_default_association": true,
+      "is_default_propagation": true,
+      "associations": ["tgw-attach-9","tgw-attach-vpn1"],
+      "propagations": ["tgw-attach-9","tgw-attach-vpn1"],
+      "routes": [
+        {
+          "destination": "10.32.0.0/16",
+          "target_attachment_id": "tgw-attach-9",
+          "blackhole": false,
+          "route_type": "static"                      // static | propagated
+        },
+        {
+          "destination": "172.16.0.0/16",
+          "target_attachment_id": "tgw-attach-vpn1",
+          "blackhole": false,
+          "route_type": "propagated"
+        }
+      ]
+    }
+  ],
+
+  "policy_tables": [],                                // optional future: TGW connect/policy if you use them
+
+  "computed": {
+    "attachment_to_association_rt": { "tgw-attach-9": "tgw-rt-1", "tgw-attach-vpn1": "tgw-rt-1" },
+    "attachment_to_propagation_rts": { "tgw-attach-9": ["tgw-rt-1"], "tgw-attach-vpn1": ["tgw-rt-1"] },
+
+    /* Optional precomputation to speed tracing (helpful at scale): 
+       For each TGW RT, fold its routes into a map from DEST CIDR → next attachment */
+    "rt_effective_targets": {
+      "tgw-rt-1": [
+        { "destination": "10.32.0.0/16", "next_attachment": "tgw-attach-9" },
+        { "destination": "172.16.0.0/16", "next_attachment": "tgw-attach-vpn1" }
+      ]
+    }
+  }
+}
+
+Why these fields matter (path tracing):
+
+route_tables.routes[]: within a TGW, longest-prefix decides which attachment you egress.
+
+associations/propagations: whether a given attachment can use a route table and advertise its prefixes into it.
+
+attachment_type tells you the fabric hop you’ll take next (to VPC, VPN, DXGW, or TGW-peering).
+
+Implementation notes (for a fast, deterministic tracer)
+
+Normalize route “targets”
+
+VPC RT target_type ∈ local | igw | natgw | tgw-attachment | vpc-peering | vgw | eni | vpce-gw | vpce-if.
+
+TGW RT targets are always attachment IDs.
+
+Longest-prefix first
+
+Always sort candidate routes by prefix length desc and pick the first non-blackhole.
+
+Subnet → RTB
+
+Never “scan all RTBs”; use computed.subnet_to_rtb[subnet_id] to jump straight to the right table.
+
+Fabric jumps
+
+VPC RT → tgw-attachment → TGW node.
+
+VPC RT → vpc-peering → peer VPC node (if modeled).
+
+TGW RT → attachment_id → VPC/VPN/DXGW node.
+
+Policy checks
+
+When you land on an ENI: fetch SG egress/ingress from your SG store (the VPC node gives you SG IDs).
+
+For subnets on each side: jump to NACL entries via associations.subnets[].nacl_id.
+
+Public/Internet flows
+
+Treat igw and natgw as internet egress hops; decide separately whether the destination is publicly routable.
+
+Optional caches
+
+In very large graphs, populate TGW computed.rt_effective_targets and (if useful) VPC per-RTB trie for fast CIDR lookups.
+
+Minimal edge model (if you still keep an edges list)
+
+Even with super-nodes, you may want a light edges list for traversal engines:
+
+[
+  { "from": "subnet-bbb1", "to": "rtb-app", "kind": "rt-association" },
+  { "from": "rtb-app", "to": "tgw-attach-9", "kind": "route", "destination": "10.32.0.0/16" },
+  { "from": "tgw-attach-9", "to": "tgw-zzzz", "kind": "attachment" },
+  { "from": "tgw-zzzz", "to": "tgw-attach-9", "kind": "rt-egress", "destination": "10.32.0.0/16" },
+  { "from": "tgw-attach-9", "to": "vpc-xxxxxxxx", "kind": "attachment" }
+]
+
+
+The tracer can rely mostly on node internals, using edges only to stitch across resource boundaries.
+
+TL;DR
+
+Use one VPC super-node and one TGW super-node per resource.
+
+Put all associations (subnet↔RTB, IGW/NATGW, VPCE, peering, TGW attachments, VGW/DXGW) inside the node.
+
+Add a tiny computed section to avoid N² scans.
+
+Keep targets typed so your path engine knows how to hop.
+
+If you want, I can generate Python dataclasses / Pydantic models for these nodes, plus a tiny longest-prefix matcher and a path tracer stub that walks VPC → TGW → VPC.
+
+You said:
+How does path tracing work with this schema?
+ChatGPT said:
+
+great question — here’s a crisp, deterministic playbook for path tracing using the VPC & TGW super-nodes I proposed. I’ll show:
+
+what the tracer needs as inputs
+
+the exact walk algorithm (forward + return)
+
+target decision tables (VPC RTs & TGW RTs)
+
+pseudocode you can drop in
+
+edge cases (NAT, IGW, VPCE, peering, VPN/DX, unknowns)
+
+an end-to-end example trace
+
+1) Inputs your tracer needs
+
+Endpoints
+
+src: ENI (preferred) → {eni_id, ip, subnet_id, vpc_id, sg_ids}
+
+dst: ENI (preferred) or IP → if ENI, resolve {ip, subnet_id, vpc_id, sg_ids}
+
+Super-nodes
+
+vpc[src.vpc_id], vpc[dst.vpc_id] (each is one VPC node with all associations)
+
+tgw[*] nodes referenced by any tgw_attachments.target_id from routes
+
+Helpers
+
+subnet_to_rtb and rtb_to_subnets (already in vpc.computed)
+
+CIDR matcher (longest-prefix)
+
+Optional: IP “public vs private” check
+
+2) High-level algorithm (forward path)
+
+Goal: compute the ordered list of hops from src.eni to dst.eni/dst.ip (forward). Then validate policy (SG/NACL) and optionally compute a return path (often symmetric fabric but NACLs must be re-checked with ephemeral ports).
+
+Steps
+
+Resolve source egress RTB
+
+rtb_id = vpc[src.vpc_id].computed.subnet_to_rtb[src.subnet_id]
+
+If missing ⇒ UNKNOWN (can’t route).
+
+Pick the best route
+
+From vpc.route_tables[rtb_id].routes, select the non-blackhole route with longest prefix that contains dst.ip.
+
+If dst.ip unknown (e.g., only a subnet) you can either:
+
+try the subnet’s CIDR center (heuristic), or
+
+deem UNKNOWN at the routing step and stop.
+
+Interpret the route target
+
+See VPC target decision table (next section).
+
+Possible next hop types: local, eni, igw, natgw, tgw-attachment, vpc-peering, vgw, vpce-if, vpce-gw.
+
+Hop across fabric
+
+If local: you’ve stayed inside the source VPC; you’re effectively delivered if the destination IP is in this VPC and is the dst.eni.
+
+If tgw-attachment: enter the TGW node and continue tracing inside the TGW:
+
+Choose the TGW association route table for the source attachment.
+
+Longest-prefix against TGW RT routes → yields a target attachment.
+
+Exit TGW via that attachment to its connected resource (VPC/VPN/DX/peer TGW).
+
+If vpc-peering: jump straight to the peer VPC node; now do step #1 there (you are “ingress” to the peer’s VPC).
+
+If igw/natgw: you’re going to the internet (or from private to internet via NAT). Unless dst.ip is public and reachable that way, delivery to a private ENI should end as no path.
+
+If eni: deliver directly to that ENI inside the same VPC.
+
+Within the destination VPC
+
+Once you’re in the destination VPC (via TGW, peering, or already local), the last mile to dst.eni is considered local delivery (intra-VPC L3). You don’t need a second RT lookup unless your model requires explicit “local” routes; practically, local is implicit for dest.ip within that VPC’s CIDRs.
+
+Record the hop list
+
+Include concrete node IDs: eni → subnet → rtb → (tgw-attach? → tgw → tgw-attach?) → vpc → subnet → eni.
+
+Policy checks
+
+SGs (stateful):
+
+Source ENI egress: allow proto/port to dst.ip (CIDR or SG-ref).
+
+Dest ENI ingress: allow proto/port from src.ip (CIDR or SG-ref).
+
+NACLs (stateless):
+
+Forward: source subnet egress on port, dest subnet ingress on port.
+
+Return: dest subnet egress ephemeral, source subnet ingress ephemeral.
+
+If your tracer is purely path-finding, you can publish the path and let a policy module decide pass/fail.
+
+3) VPC route target decision table
+target_type	Meaning / Next hop	Deliver to private ENI?
+local	Stay in VPC; L3 reaches any IP in VPC CIDRs	✅ Yes (if IP is inside)
+eni	Directly to ENI ID	✅ Yes (same VPC)
+tgw-attachment	Enter TGW via this attachment	✅ Via TGW
+vpc-peering	Cross to peer VPC (assume reverse routes exist)	✅ If peer routes exist
+igw	Internet egress	❌ For private ENI
+natgw	Egress via NAT to Internet	❌ For private ENI
+vgw	To on-prem via VPN/DX	✅ If dest IP in on-prem
+vpce-if / vpce-gw	To an AWS service endpoint	➖ Service-specific
+
+Notes:
+
+For peering, you typically need reciprocal routes in the peer VPC; your discovery can verify presence.
+
+IGW/NATGW are useful only when dst.ip is public on internet (or a public NLB, etc.). For ENI-to-ENI in private space, they do not help.
+
+4) TGW routing decision
+
+Inside a TGW:
+
+Identify the source attachment (the one you entered from).
+
+Use its association route table (in node: attachment.association_route_table_id).
+
+Longest-prefix match in that TGW RT to find target_attachment_id.
+
+Exit TGW via target_attachment_id:
+
+If VPC: land in that VPC node.
+
+If VPN/DXGW: land in on-prem fabric (your model may end here if you don’t model on-prem as nodes).
+
+Important: If a prefix isn’t present in the association RT but is present in some other RT where your source attachment is not associated, the packet cannot use it. That’s why the association matters.
+
+5) Pseudocode (drop-in)
+from ipaddress import ip_address, ip_network
+
+def longest_prefix(routes, ip):
+    matches = []
+    for r in routes:
+        if r.get("blackhole"): 
+            continue
+        try:
+            if ip_address(ip) in ip_network(r["destination"], strict=False):
+                matches.append((ip_network(r["destination"], strict=False).prefixlen, r))
+        except Exception:
+            continue
+    if not matches:
+        # optionally include default route if present
+        for r in routes:
+            if not r.get("blackhole") and r["destination"] in ("0.0.0.0/0", "::/0"):
+                matches.append((0, r))
+    matches.sort(key=lambda x: x[0], reverse=True)
+    return matches[0][1] if matches else None
+
+def trace_vpc_egress(vpc_node, subnet_id, dst_ip):
+    # 1) find associated RTB
+    rtb_id = vpc_node["computed"]["subnet_to_rtb"].get(subnet_id)
+    if not rtb_id:
+        return None, ["NO_RTB_FOR_SUBNET"]
+    rtb = next(rt for rt in vpc_node["associations"]["route_tables"] if rt["id"] == rtb_id)
+
+    # 2) pick route
+    r = longest_prefix(rtb["routes"], dst_ip)
+    if not r:
+        return None, ["NO_MATCHING_ROUTE"]
+    hop = {
+        "rtb": rtb_id,
+        "cidr": r["destination"],
+        "target_type": r["target_type"],
+        "target_id": r.get("target_id")
+    }
+    return hop, []
+
+def trace_tgw(tgw_node, src_attach_id, dst_ip):
+    # find association RT for the source attachment
+    assoc_rt_id = None
+    for a in tgw_node["attachments"]:
+        if a["id"] == src_attach_id:
+            assoc_rt_id = a["association_route_table_id"]
+            break
+    if not assoc_rt_id:
+        return None, ["NO_TGW_ASSOCIATION_RT"]
+
+    rt = next(rt for rt in tgw_node["route_tables"] if rt["id"] == assoc_rt_id)
+    r = longest_prefix(rt["routes"], dst_ip)
+    if not r:
+        return None, ["NO_TGW_ROUTE"]
+    return {
+        "tgw_rt": assoc_rt_id,
+        "destination": r["destination"],
+        "target_attachment_id": r["target_attachment_id"]
+    }, []
+
+
+Top-level trace (forward):
+
+def trace_path(src, dst, vpcs, tgws):
+    path = [src["eni"]]
+    notes = []
+
+    # trivial: same ENI/IP
+    if dst.get("eni") and src["eni"] == dst["eni"]:
+        return path, notes
+
+    # sanity
+    if not dst.get("ip"):
+        return None, ["DEST_IP_UNKNOWN"]
+
+    # 1) VPC egress from source
+    vpc_src = vpcs[src["vpc"]]
+    hop, n = trace_vpc_egress(vpc_src, src["subnet"], dst["ip"])
+    if n: notes += n
+    if not hop: return None, notes
+    path += [src["subnet"], hop["rtb"]]
+
+    tt, tid = hop["target_type"], hop["target_id"]
+
+    if tt == "local":
+        # must be same VPC and IP within VPC CIDRs
+        if src["vpc"] == dst.get("vpc"):
+            path += [dst["subnet"], dst.get("eni") or dst["ip"]]
+            return path, notes
+        else:
+            return None, notes + ["LOCAL_ROUTE_TO_NON_LOCAL_DEST"]
+
+    if tt == "eni":
+        path += [tid]
+        return path, notes
+
+    if tt == "vpc-peering":
+        # jump to peer VPC
+        peer_vpc_id = next(p["peer_vpc_id"] for p in vpc_src["associations"]["peering_connections"] if p["id"] == tid)
+        vpc_peer = vpcs[peer_vpc_id]
+        # in peer VPC, traffic is effectively local to reach the dest IP
+        path += [tid, peer_vpc_id, dst["subnet"], dst.get("eni") or dst["ip"]]
+        return path, notes
+
+    if tt == "tgw-attachment":
+        # enter TGW
+        tgw_id = next(a["tgw_id"] for a in vpc_src["associations"]["tgw_attachments"] if a["id"] == tid)
+        tgw = tgws[tgw_id]
+        path += [tid, tgw_id]
+        tgw_hop, n2 = trace_tgw(tgw, tid, dst["ip"])
+        if n2: notes += n2
+        if not tgw_hop: return None, notes
+        exit_attach = tgw_hop["target_attachment_id"]
+        path += [exit_attach]
+        # where does exit_attach land?
+        # find attachment resource (VPC or VPN/DX)
+        att = next(a for a in tgw["attachments"] if a["id"] == exit_attach)
+        if att["attachment_type"] == "vpc":
+            vpc_out = vpcs[att["resource_id"]]
+            # last mile local inside dest VPC
+            path += [att["resource_id"], dst["subnet"], dst.get("eni") or dst["ip"]]
+            return path, notes
+        else:
+            path += [att["attachment_type"]]
+            return path, notes  # ends at on-prem etc.
+
+    if tt in ("igw","natgw"):
+        path += [tid]
+        # unless dst.ip is public Internet target you model, you stop here as non-deliverable to private ENIs
+        notes += ["INTERNET_EGRESS_PATH"]
+        return path, notes
+
+    # Other targets (vpce, vgw) – treat similarly based on your model
+    notes += [f"UNHANDLED_TARGET:{tt}"]
+    return path, notes
+
+6) Return path / policy validation
+
+The fabric (VPC local, TGW, peering) is typically symmetric. You can reuse the same logic starting from dst back to src to be strict.
+
+NACLs: must explicitly allow the 4 legs:
+
+source egress <port>
+
+dest ingress <port>
+
+dest egress [ephemeral]
+
+source ingress [ephemeral]
+
+SGs are stateful, but you still require:
+
+source egress rule allows <proto>/<port> to dest (CIDR or SG-ref)
+
+dest ingress rule allows <proto>/<port> from source
+
+You can run path tracing + policy as two phases. If path fails → DENY (routing). If path ok and SGs fail → DENY (SG). If SG ok and any NACL leg fails → DENY (NACL). If facts missing → UNKNOWN.
+
+7) Edge cases & tips
+
+Multiple CIDRs per VPC: check all; local is true if dst.ip ∈ any(vpc.cidrs).
+
+Multiple subnets share an RTB: fine; association map already handles it.
+
+TGW multi-RT design: always use the association RT of the entering attachment.
+
+Blackhole routes: skip.
+
+Peering: routing is per-VPC; ensure peer VPC has return routes (you can verify presence during discovery).
+
+VPCE: path ends at service endpoint ENIs; treat as a terminal service hop unless you simulate AWS service L3.
+
+NAT: from private subnet to Internet only; never to private ENIs in another VPC.
+
+No dst.ip (destination is a Subnet or SG only): routing becomes ambiguous → UNKNOWN unless you pick a representative IP (not recommended for enforcement).
+
+8) Tiny worked example
+
+src: ENI eni-a in subnet-a (VPC vpc-1), src.ip=10.16.2.10
+
+dst: ENI eni-b in subnet-z (VPC vpc-2), dst.ip=10.32.5.7
+
+vpc-1.rtb-app has route 10.32.0.0/16 → tgw-attach-9
+
+tgw-rt-1 has route 10.32.0.0/16 → tgw-attach-22 (to vpc-2)
+
+Trace:
+eni-a → subnet-a → rtb-app → tgw-attach-9 → tgw-zzzz → tgw-attach-22 → vpc-2 → subnet-z → eni-b
+
+Policy:
+
+SG egress on src allows tcp/443 to 10.32.0.0/16 ✅
+
+SG ingress on dst allows tcp/443 from 10.16.0.0/16 ✅
+
+NACLs allow fwd 443 & return ephemeral on both subnets ✅
+
+→ ALLOW
+
+Performance & complexity
+
+VPC hop: O(1) to get RTB (map lookup) + O(R) to scan routes (R usually small). Speed up with a per-RTB prefix trie if needed.
+
+TGW hop: O(1) to get association RT + O(T) to scan routes. Again, prefix trie optional.
+
+End-to-end is essentially O(R + T) for a single flow — very fast.
+
+If you’d like, I can wrap this into a trace_path() module that consumes the super-nodes and outputs both the hop list and a structured explanation you can surface to users (plus a policy checker that annotates which control blocked the flow).
