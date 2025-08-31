@@ -1,0 +1,265 @@
+Here is the complete requirements for the tool. Prompts and expectations from the tool.
+
+
+
+Prompt1: Check connectivity between instance1 and instance2? Are they reachabel?
+	- Tool should use resource finder to get enis, call network tracer that uses eni for path tracer ->  give details of the path
+Prompt2: See if instance 1 can access instance 2 on port 443? 
+	- Tool should use resource finder to get enis, call network tracer that uses eni for path tracer, use resource finder to check security groups of enis ->  give details of the path and security groups
+Prompt 3: Jira story says, instance1 should access instance 2 on port 8443. give implementation steps
+	- Tool should use resource finder to get enis, call network tracer that uses eni for path tracer, use resource finder to check security groups of enis ->  give details of the path and security groups and give steps to meet jira requirements
+
+Prompt 4: Jira story says, instance1 should access instance 2 on port 8443 and here is terraform plan output. Tell me if it meets the requiements
+	- Tool should use resource finder to get enis, call network tracer that uses eni for path tracer, use resource finder to check security groups of enis and analyze if terraform plan will meet the requirements ->  give details of the path and security groups and report if terraform meets or doesn't meet.
+
+How should multi agent be architected.
+ChatGPT said:
+Thought for 17s
+
+Here’s a tight multi-agent architecture tailored exactly to your four prompts, using Strands GraphBuilder (graph-first + conditional branches) and your two tools (aws-resource-finder, l3-trace-path).
+
+Agents (6 core, 1 optional)
+
+Classifier/Planner — turns the user prompt into a task spec
+
+Outputs: intent ∈ {connectivity, port_check, jira_steps, jira_tf_validate}, src_id, dst_id, port, plus assumptions.
+
+Resource Resolver — resolves “instance1/instance2” → ENIs and SGs via aws-resource-finder
+
+Outputs: {src:{enis:[], sgs:[]}, dst:{enis:[], sgs:[]}}.
+
+Path Tracer — runs l3-trace-path for each (src_eni, dst_target) pair
+
+Outputs: paths[] with reachable, hops[], blockers[].
+
+SG/Port Analyzer — inspects SGs relevant to the ENIs and evaluates port policy (ingress/egress, stateful symmetry).
+
+Outputs: sg_findings[], port_verdict (ALLOW/DENY/UNKNOWN), evidence.
+
+Jira Steps Generator — if it’s a Jira-type request, produce implementation steps to satisfy the requirement (network + SG changes).
+
+Outputs: jira_steps[] (atomic, testable), AC/DoD.
+
+Terraform Plan Validator — if a TF plan is supplied, verify it will achieve the Jira requirement (and callouts if gaps).
+
+Inputs: plan.json (text or object from prompt).
+
+Outputs: meets_requirements: true/false, deltas vs. desired state, evidence mapping to AC.
+
+Result Assembler — composes final answer for the user with evidence (paths + SGs + verdict + steps).
+
+Optional later: a Change Simulator that re-runs tracer checks post-apply.
+
+Orchestration (GraphBuilder)
+
+Use a single graph with conditional edges to branch to the right subflow.
+Mermaid (legend: 🔷 LLM, 🛠️ tool, 🐍 python):
+
+flowchart TD
+    IN[Inputs: prompt, optional plan.json]
+    A[🔷 Classifier/Planner] --> B[🛠️ Resource Resolver (aws-resource-finder)]
+    B --> C[🛠️ Path Tracer (l3-trace-path)]
+    B --> D[🔷 SG/Port Analyzer]
+    C --> E[🔷 Result Assembler]
+    D --> E
+
+    %% Jira-only branch
+    A -- if intent in {jira_steps, jira_tf_validate} --> F[🔷 Jira Steps Generator]
+    F --> E
+
+    %% TF validation only when plan present & intent=jira_tf_validate
+    A -- if jira_tf_validate & plan --> G[🐍 Terraform Plan Validator]
+    G --> E
+
+Branching conditions (callables)
+def is_connectivity(state):
+    p = state.results.get("planner");  d = getattr(p, "result", {}) if p else {}
+    return (d.get("intent") == "connectivity")
+
+def is_port_check(state):
+    p = state.results.get("planner");  d = getattr(p, "result", {}) if p else {}
+    return (d.get("intent") == "port_check") and bool(d.get("port"))
+
+def is_jira_steps(state):
+    p = state.results.get("planner");  d = getattr(p, "result", {}) if p else {}
+    return d.get("intent") == "jira_steps"
+
+def is_jira_tf_validate(state):
+    p = state.results.get("planner");  d = getattr(p, "result", {}) if p else {}
+    has_plan = bool(d.get("tf_plan_text") or d.get("tf_plan_json"))
+    return d.get("intent") == "jira_tf_validate" and has_plan
+
+
+Wire them:
+
+builder.add_edge("planner", "resource_resolver")  # always
+builder.add_edge("resource_resolver", "path_tracer", condition=lambda s: is_connectivity(s) or is_port_check(s) or is_jira_steps(s) or is_jira_tf_validate(s))
+builder.add_edge("resource_resolver", "sg_port_analyzer", condition=lambda s: is_port_check(s) or is_jira_steps(s) or is_jira_tf_validate(s))
+builder.add_edge("planner", "jira_steps", condition=is_jira_steps)
+builder.add_edge("planner", "tf_validator", condition=is_jira_tf_validate)
+# joins
+builder.add_edge("path_tracer", "result_assembler")
+builder.add_edge("sg_port_analyzer", "result_assembler")
+builder.add_edge("jira_steps", "result_assembler")
+builder.add_edge("tf_validator", "result_assembler")
+
+What each prompt triggers
+Prompt 1 — “Check connectivity between instance1 and instance2? Are they reachable?”
+
+Flow: Classifier → Resolver → Path Tracer → Result
+
+Resolver: aws-resource-finder to get ENIs for both instances.
+
+Path Tracer: l3-trace-path on (src_enis × dst); summarize reachable, hops, blockers.
+
+Result: concise yes/no + hop-list + blockers (SG/NACL/route/TGW/LB).
+
+Prompt 2 — “See if instance1 can access instance2 on port 443?”
+
+Flow: Classifier → Resolver → Path Tracer (optional) + SG/Port Analyzer → Result
+
+Analyzer: check SG egress (src) and SG ingress (dst) for TCP/443, related NACLs, and return port_verdict.
+
+Path tracer provides reachability context (e.g., NAT/TGW path) if you choose to include it.
+
+Prompt 3 — “Jira story says … port 8443. Give implementation steps”
+
+Flow: Classifier → Resolver → Path Tracer + SG/Port Analyzer → Jira Steps → Result
+
+Jira Steps Generator emits implementation steps: e.g., “Update SG sg-abc to allow TCP/8443 from src_cidrs” + AC/DoD.
+
+Result bundles evidence (paths + SGs) + steps.
+
+Prompt 4 — “Jira story says … 8443 and here is terraform plan output. Tell me if it meets requirements”
+
+Flow: Classifier → Resolver → Path Tracer + SG/Port Analyzer → TF Plan Validator → Result
+
+Validator parses plan (JSON or terraform show -json text) and checks against the Jira requirement (allow TCP/8443 from source to dest), mapping each AC to a verifiable fact in the plan and expected live outcome.
+
+IO Contracts (succinct)
+
+Classifier/Planner (LLM) →
+
+{
+  "intent": "connectivity|port_check|jira_steps|jira_tf_validate",
+  "src_hint": "instance1",
+  "dst_hint": "instance2",
+  "port": 8443,
+  "assumptions": ["..."],
+  "tf_plan_text": "<optional raw plan>"  // only for jira_tf_validate
+}
+
+
+Resource Resolver (tool: aws-resource-finder) →
+
+{
+  "src": { "enis": ["eni-..."], "sgs": ["sg-..."], "account":"...", "region":"..." },
+  "dst": { "enis": ["eni-..."], "sgs": ["sg-..."], "account":"...", "region":"..." }
+}
+
+
+Path Tracer (tool: l3-trace-path) →
+
+{
+  "paths": [
+    { "src_eni": "eni-1", "dst": "eni-2", "reachable": false,
+      "hops": [ {"type":"eni","id":"eni-1"}, {"type":"tgw","id":"tgw-..."} ],
+      "blockers": ["sg:sg-xyz:ingress","nacl:subnet-abc:deny","route:rtb-123:missing"]
+    }
+  ]
+}
+
+
+SG/Port Analyzer (LLM) →
+
+{
+  "port": 8443,
+  "port_verdict": "ALLOW|DENY|UNKNOWN",
+  "sg_findings": [
+    { "resource":"sg-xyz", "direction":"ingress", "rule":"tcp/8443 from 10.0.0.0/8", "status":"present|missing" }
+  ],
+  "notes": ["stateful egress OK", "no NACL denies observed in subnet-..."]
+}
+
+
+Jira Steps Generator (LLM) →
+
+{
+  "steps":[
+    "Add ingress tcp/8443 on sg-dst from src CIDRs",
+    "Ensure egress tcp/8443 on sg-src",
+    "Re-run reachability after change window"
+  ],
+  "acceptanceCriteria":[
+    "l3-trace(src_eni -> dst) reachable=true on tcp/8443",
+    "No 0.0.0.0/0 granted unless explicitly approved"
+  ],
+  "definitionOfDone":[ "Peer review", "Flow logs verified", "Evidence attached" ]
+}
+
+
+Terraform Plan Validator (🐍/LLM hybrid) →
+
+{
+  "meets_requirements": true,
+  "evidence": [
+    "aws_security_group_rule.dst_8443 will be created with cidr_blocks=[...]", 
+    "No conflicting denies in NACLs"
+  ],
+  "gaps":[]
+}
+
+
+Result Assembler → user: short conclusion + evidence tables + next steps.
+
+Prompt routing (how the Classifier decides)
+
+If the text contains “reachable”, “connectivity” → intent=connectivity.
+
+If it contains “port <X>” without Jira → intent=port_check.
+
+If it starts with/contains “Jira story says” without plan → intent=jira_steps.
+
+If it contains “Jira story says … and here is terraform plan” → intent=jira_tf_validate, and capture the plan chunk.
+
+Strands snippets (GraphBuilder)
+
+Add nodes (names match above):
+
+builder.add_node(planner,            "planner")            # LLM
+builder.add_node(resource_resolver,  "resource_resolver")  # tool: aws-resource-finder
+builder.add_node(path_tracer,        "path_tracer")        # tool: l3-trace-path
+builder.add_node(sg_port_analyzer,   "sg_port_analyzer")   # LLM
+builder.add_node(jira_steps,         "jira_steps")         # LLM
+builder.add_node(tf_validator,       "tf_validator")       # python+LLM
+builder.add_node(result_assembler,   "result_assembler")   # LLM
+
+
+Edges & conditions (callables from above):
+
+builder.add_edge("planner", "resource_resolver")
+builder.add_edge("resource_resolver", "path_tracer",
+                 condition=lambda s: is_connectivity(s) or is_port_check(s) or is_jira_steps(s) or is_jira_tf_validate(s))
+builder.add_edge("resource_resolver", "sg_port_analyzer",
+                 condition=lambda s: is_port_check(s) or is_jira_steps(s) or is_jira_tf_validate(s))
+builder.add_edge("planner", "jira_steps", condition=is_jira_steps)
+builder.add_edge("planner", "tf_validator", condition=is_jira_tf_validate)
+builder.add_edge("path_tracer", "result_assembler")
+builder.add_edge("sg_port_analyzer", "result_assembler")
+builder.add_edge("jira_steps", "result_assembler")
+builder.add_edge("tf_validator", "result_assembler")
+builder.set_entry_point("planner")
+
+Why this fits your requirements
+
+Prompt 1: minimal path + blockers → ✅ Path Tracer only.
+
+Prompt 2: adds port-aware SG analysis → ✅ Analyzer joins.
+
+Prompt 3: adds implementation steps (AC/DoD) → ✅ Jira Steps node.
+
+Prompt 4: adds plan validation vs. requirement → ✅ TF Validator node.
+
+This graph stays deterministic, auditable, and testable, while using conditional branching to avoid unnecessary work. Your two core tools are used exactly where needed, and everything else is cleanly modular.
+
+If you want, I can drop the exact GraphBuilder Python (with external prompts wired, like the scaffold in the canvas) specialized to these four intents so you can run it as-is.
